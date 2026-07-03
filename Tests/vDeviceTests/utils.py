@@ -31,6 +31,7 @@ import json
 import subprocess
 import tempfile
 import re
+import time
 from pathlib import Path
 
 
@@ -148,20 +149,26 @@ def send_jsonrpc_command(method, params=None, request_id=1, timeout=5):
         return None
 
 
-def activate_plugin(callsign):
+def activate_plugin(callsign, retries=1, retry_delay=2.0, timeout=5):
     '''Activate an RDK plugin via Controller.1.activate.
+    Retries transient failures so callers can survive controller/plugin startup races.
     Returns True on success, False otherwise.
     '''
-    response = send_jsonrpc_command(
-        "Controller.1.activate",
-        params={"callsign": callsign},
-        request_id=1234567890,
-    )
-    if not response:
-        return False
-    if "error" in response:
-        return False
-    return "result" in response
+    attempts = max(1, int(retries))
+    for attempt in range(1, attempts + 1):
+        response = send_jsonrpc_command(
+            "Controller.1.activate",
+            params={"callsign": callsign},
+            request_id=1234567890,
+            timeout=timeout,
+        )
+        if response and "error" not in response and "result" in response:
+            return True
+
+        if attempt < attempts:
+            time.sleep(retry_delay)
+
+    return False
 
 def send_curl_command(curl_command):
     '''This function is used to send the curl commands to get the output response using os module'''

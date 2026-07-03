@@ -7,8 +7,14 @@ git clone git@github.com:rdkcentral/entservices-hdmicecsource.git
 cd entservices-hdmicecsource/Tests/vDeviceTests
 
 EXECUTION:
-with time : python3 suiteManager.py -t hdmicecsource 
-without time: python3 suiteManager.py hdmicecsource
+with time : python3 SuitManager.py -time
+without time: python3 SuitManager.py
+
+Startup flow:
+1. Set RDK profile to STB via Profile.sh
+2. Activate org.rdk.HdmiCecSource plugin
+3. Run Init_Devicelist_Populate 
+4. Run all testcase modules in suite order
 
 Default Actions:
 Plugin activation is now done by default before suite execution:
@@ -35,19 +41,20 @@ Useful overrides:
 Examples:
 
 # when running directly inside QEMU guest (services on localhost)
-python3 suiteManager.py hdmicecsource
+python3 SuitManager.py
 
 # when running from host against QEMU target IP
 export TARGET_HOST=192.168.1.50
 export JSONRPC_PORT=9998
 export VCOMPONENT_PORT=8080
-python3 suiteManager.py hdmicecsource
+python3 SuitManager.py
 
 # full URL override form
 export WPEFRAMEWORK_JSONRPC_URL=http://192.168.1.50:9998/jsonrpc
 export VCOMPONENT_API_URL=http://192.168.1.50:8080/api/postKVP
-python3 suiteManager.py hdmicecsource
+python3 SuitManager.py
 
 
 Troubleshooting:
 - If you see connection errors, verify WPEFramework JSON-RPC and the vComponent API are reachable using the endpoint overrides above.
+

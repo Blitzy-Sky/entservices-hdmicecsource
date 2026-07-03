@@ -35,8 +35,9 @@ import sys
 import time
 from pathlib import Path
 import os
+import subprocess
 
-from utils import log_error, log_info, log_success, send_jsonrpc_command, WPEFRAMEWORK_JSONRPC_URL
+from utils import activate_plugin, log_error, log_info, log_success, WPEFRAMEWORK_JSONRPC_URL
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -91,6 +92,19 @@ SUITE_INIT_MODULES = {
     "hdmicecsource": "Init_Devicelist_Populate",
 }
 
+SUITE_PROFILE_SCRIPTS = {
+    "hdmicecsource": "Profile.sh",
+}
+
+SUITE_RDK_PROFILES = {
+    "hdmicecsource": "STB",
+}
+
+PLUGIN_ACTIVATION_RETRIES = 4
+PLUGIN_ACTIVATION_RETRY_DELAY_S = 1.0
+PLUGIN_ACTIVATION_TIMEOUT_S = 3
+PLUGIN_SETTLE_TIME_S = 3
+
 
 def normalize_suite_name(raw_name):
     return raw_name.strip().replace("_", "").replace("-", "").lower()
@@ -109,19 +123,48 @@ def load_test_cases(suite_name):
         test_cases.append((module_name, module.run_test))
 
     return suite_config["banner"], test_cases
-
-
-def activate_plugin_via_curl(callsign):
-    response = send_jsonrpc_command(
-        "Controller.1.activate",
-        params={"callsign": callsign},
-        request_id=1234567890,
-    )
-    if not response:
+def set_rdk_profile_via_script(suite_name, profile):
+    script_name = SUITE_PROFILE_SCRIPTS.get(suite_name, "Profile.sh")
+    script_path = BASE_DIR / script_name
+    if not script_path.exists():
+        log_error(f"Profile script not found: {script_path}")
         return False
-    if "error" in response:
+
+    commands = [
+        ["sh", str(script_path), profile],
+        ["bash", str(script_path), profile],
+    ]
+
+    last_error = None
+    for cmd in commands:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+        except FileNotFoundError as exc:
+            last_error = exc
+            continue
+
+        stdout_text = (proc.stdout or "").strip()
+        stderr_text = (proc.stderr or "").strip()
+
+        if proc.returncode == 0:
+            if stdout_text:
+                log_info(stdout_text)
+            if stderr_text:
+                log_info(stderr_text)
+            return True
+
+        log_error(f"Profile command failed ({' '.join(cmd)}), rc={proc.returncode}")
+        if stdout_text:
+            log_error(stdout_text)
+        if stderr_text:
+            log_error(stderr_text)
         return False
-    return "result" in response
+
+    if last_error:
+        log_error(f"Unable to run profile script with shell interpreter: {last_error}")
+    else:
+        log_error("Unable to run profile script with available shell interpreter")
+    return False
 
 
 def run_suite_init(suite_name):
@@ -161,14 +204,30 @@ def run_suite(suite_name):
     banner, test_cases = load_test_cases(suite_name)
     print(banner)
 
+    # Flow requirement: profile is always set from suite defaults (STB for hdmicecsource).
+    profile = SUITE_RDK_PROFILES.get(suite_name)
+    if profile:
+        profile = profile.strip().upper()
+        log_info(f"Setting RDK profile to '{profile}' via Profile.sh ")
+        if not set_rdk_profile_via_script(suite_name, profile):
+            log_error("Aborting suite because RDK profile setup failed.")
+            return False
+        log_success(f"RDK profile set to {profile}")
+
     auto_activate = os.environ.get("AUTO_ACTIVATE_PLUGINS", "1").lower() not in ("0", "false", "no")
     callsign = SUITE_PLUGIN_CALLSIGNS.get(suite_name)
     if auto_activate and callsign:
         log_info(f"Auto-activating plugin '{callsign}' via curl JSON-RPC at {WPEFRAMEWORK_JSONRPC_URL}")
-        if activate_plugin_via_curl(callsign):
+        if activate_plugin(
+            callsign,
+            retries=PLUGIN_ACTIVATION_RETRIES,
+            retry_delay=PLUGIN_ACTIVATION_RETRY_DELAY_S,
+            timeout=PLUGIN_ACTIVATION_TIMEOUT_S,
+        ):
             log_success(f"Plugin activated: {callsign}")
-            log_info("Waiting 6s for plugin to fully initialise...")
-            time.sleep(6)
+            log_info(f"Waiting {PLUGIN_SETTLE_TIME_S}s for plugin to fully initialise...")
+            time.sleep(PLUGIN_SETTLE_TIME_S)
+            os.environ["HDMICEC_PLUGIN_READY"] = "1"
         else:
             log_error(f"Plugin activation failed: {callsign}")
             log_error("Check JSON-RPC endpoint reachability and plugin availability before running tests.")
@@ -219,23 +278,24 @@ def run_suite(suite_name):
 
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Run HDMI CEC test suites")
-    parser.add_argument("suite", help=f"Test suite name. Available: {list(SUITES.keys())}")
-    parser.add_argument("-t", "--timing", action="store_true", help="Enable timing output for passed test cases")
-    
-    args = parser.parse_args()
-    
-    # Set environment variable for timing mode
-    if args.timing:
-        os.environ["HDMICEC_TIMING_ENABLED"] = "1"
-    
-    suite_arg = normalize_suite_name(args.suite)
-    matching = [k for k in SUITES if normalize_suite_name(k) == suite_arg]
-    if not matching:
-        log_error(f"Unknown suite '{args.suite}'. Available: {list(SUITES.keys())}")
-        sys.exit(1)
+    # Only support two invocation forms:
+    #   python3 SuitManager.py
+    #   python3 SuitManager.py -time
+    argv = sys.argv[1:]
+    if len(argv) == 0:
+        timing_enabled = False
+    elif len(argv) == 1 and argv[0] == "-time":
+        timing_enabled = True
+    else:
+        print("usage: SuitManager.py [-time]", file=sys.stderr)
+        print("SuitManager.py: error: only '-time' is supported", file=sys.stderr)
+        sys.exit(2)
 
-    ok = run_suite(matching[0])
+    # Set environment variable for timing mode
+    if timing_enabled:
+        os.environ["HDMICEC_TIMING_ENABLED"] = "1"
+
+    ok = run_suite("hdmicecsource")
     sys.exit(0 if ok else 1)
+
+

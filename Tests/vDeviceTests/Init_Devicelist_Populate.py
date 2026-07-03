@@ -196,12 +196,17 @@ def run_test():
     """
 
     # ── Step 0: ensure plugin is active (standalone-safe) ───────────────────
-    log_info(f"Init_Devicelist_Populate Step 0: activate plugin org.rdk.HdmiCecSource via {WPEFRAMEWORK_JSONRPC_URL}")
-    if not activate_plugin("org.rdk.HdmiCecSource"):
-        log_error(f"Init_Devicelist_Populate Failed ❌: plugin activation failed (org.rdk.HdmiCecSource)")
-        return False
-    # Align with suiteManager startup guard to let CEC threads fully initialize.
-    time.sleep(6)
+    # Skip duplicate activation when the suite manager has already prepared the plugin.
+    plugin_ready = os.environ.get("HDMICEC_PLUGIN_READY") == "1"
+    if plugin_ready:
+        log_info("Init_Devicelist_Populate Step 0: plugin activation already completed by suite manager")
+    else:
+        log_info(f"Init_Devicelist_Populate Step 0: activate plugin org.rdk.HdmiCecSource via {WPEFRAMEWORK_JSONRPC_URL}")
+        if not activate_plugin("org.rdk.HdmiCecSource"):
+            log_error(f"Init_Devicelist_Populate Failed ❌: plugin activation failed (org.rdk.HdmiCecSource)")
+            return False
+        # Standalone runs still need a short settle window before configure.
+        time.sleep(3)
 
     # ── Step 1: configure ────────────────────────────────────────────────────
     log_info("Init_Devicelist_Populate Step 1: configure vcomponent network")
