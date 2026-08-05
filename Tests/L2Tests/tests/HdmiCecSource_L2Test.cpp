@@ -1886,6 +1886,41 @@ TEST_F(HdmiCecSource_L2Test, OnDeviceAddedEvent)
     }
 }
 
+/**
+ * @brief Test OnDeviceRemoved event
+ *
+ * This test verifies that the OnDeviceRemoved event is received correctly.
+ */
+TEST_F(HdmiCecSource_L2Test, OnDeviceRemovedEvent)
+{
+    if (CreateHdmiCecSourceInterfaceObject() != Core::ERROR_NONE) {
+        TEST_LOG("Invalid HdmiCecSource_Client");
+    } else {
+        EXPECT_TRUE(m_controller_cecSource != nullptr);
+        if (m_controller_cecSource) {
+            EXPECT_TRUE(m_cecSourcePlugin != nullptr);
+            if (m_cecSourcePlugin) {
+                // Simulate device removed event
+                int testLogicalAddress = 4;
+                m_notificationHandler.OnDeviceRemoved(testLogicalAddress);
+
+                uint32_t status = WaitForRequestStatus(EVNT_TIMEOUT, ON_DEVICE_REMOVED);
+                EXPECT_EQ(status, ON_DEVICE_REMOVED);
+                EXPECT_EQ(m_notificationHandler.GetLogicalAddress(), testLogicalAddress);
+                TEST_LOG("OnDeviceRemoved event verified");
+
+                m_cecSourcePlugin->Unregister(&m_notificationHandler);
+                m_cecSourcePlugin->Release();
+            } else {
+                TEST_LOG("m_cecSourcePlugin is NULL");
+            }
+            m_controller_cecSource->Release();
+        } else {
+            TEST_LOG("m_controller_cecSource is NULL");
+        }
+    }
+}
+
 //======================================== Frame Injection Tests ========================================
 
 /**

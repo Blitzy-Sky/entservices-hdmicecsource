@@ -13,7 +13,7 @@
  * @dependencies
  *  - utils.py
  *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
+ *  - SuitManager.py
  *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
