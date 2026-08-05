@@ -22,6 +22,9 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include "HdmiCecSourceImplementation.h"
 #include "HdmiCec.h"
@@ -78,6 +81,274 @@ namespace
 		fileContentStream.close();
 	}
 
+    static bool readFile(const char* fileName, bool& filePresent, std::string& fileContents)
+    {
+        std::ifstream fileContentStream(fileName, std::ios::in | std::ios::binary);
+        if (!fileContentStream.is_open()) {
+            filePresent = false;
+            fileContents.clear();
+            return true;
+        }
+
+        filePresent = true;
+        fileContents.clear();
+        char byte = '\0';
+        while (fileContentStream.get(byte)) {
+            fileContents.push_back(byte);
+        }
+
+        return !fileContentStream.bad();
+    }
+
+    static bool writeFile(const char* fileName, const std::string& fileContents)
+    {
+        std::ofstream fileContentStream(fileName, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!fileContentStream.is_open()) {
+            return false;
+        }
+
+        fileContentStream.write(fileContents.data(), static_cast<std::streamsize>(fileContents.size()));
+        fileContentStream.close();
+        return !fileContentStream.fail();
+    }
+
+    // The CEC settings file lives under a directory that neither CI nor a developer host
+    // provisions (/opt/persistent exists, /opt/persistent/ds does not).  A fixture must
+    // establish its own preconditions, so create the missing parent directory here and
+    // report whether it had to be created so it can be removed again afterwards.
+    static bool ensureParentDirectory(const char* fileName, bool& directoryCreated, std::string& directoryPath)
+    {
+        directoryCreated = false;
+        directoryPath.clear();
+
+        const std::string path(fileName);
+        const std::string::size_type separator = path.find_last_of('/');
+        if (separator == std::string::npos || separator == 0) {
+            return true;
+        }
+
+        directoryPath = path.substr(0, separator);
+
+        struct stat directoryStat;
+        if (stat(directoryPath.c_str(), &directoryStat) == 0) {
+            return S_ISDIR(directoryStat.st_mode);
+        }
+
+        if (mkdir(directoryPath.c_str(), 0777) != 0) {
+            directoryPath.clear();
+            return false;
+        }
+
+        directoryCreated = true;
+        return true;
+    }
+
+    static void removeCreatedDirectory(const bool directoryCreated, const std::string& directoryPath)
+    {
+        if (directoryCreated && !directoryPath.empty()) {
+            rmdir(directoryPath.c_str());
+        }
+    }
+
+    static bool restoreFile(const char* fileName, const bool wasPresent, const std::string& fileContents)
+    {
+        if (wasPresent) {
+            return writeFile(fileName, fileContents);
+        }
+
+        std::ifstream fileContentStream(fileName, std::ios::in | std::ios::binary);
+        if (!fileContentStream.is_open()) {
+            return true;
+        }
+
+        fileContentStream.close();
+        return (std::remove(fileName) == 0);
+    }
+
+    // Snapshot both process-global files and disable CEC worker threads so lifecycle callbacks remain deterministic.
+    class ScopedLifecycleFiles {
+    public:
+        ScopedLifecycleFiles()
+            : m_devicePropertiesWasPresent(false)
+            , m_devicePropertiesContents()
+            , m_devicePropertiesSnapshotCaptured(readFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents))
+            , m_cecSettingsWasPresent(false)
+            , m_cecSettingsContents()
+            , m_cecSettingsSnapshotCaptured(readFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents))
+            , m_cecSettingsDirectoryCreated(false)
+            , m_cecSettingsDirectoryPath()
+            , m_devicePropertiesProvisioned(false)
+            , m_cecSettingsProvisioned(false)
+            , m_restored(false)
+            , m_restoreSucceeded(false)
+        {
+            if (m_devicePropertiesSnapshotCaptured && m_cecSettingsSnapshotCaptured
+                && ensureParentDirectory(CEC_SETTING_ENABLED_FILE, m_cecSettingsDirectoryCreated, m_cecSettingsDirectoryPath)) {
+                m_devicePropertiesProvisioned = writeFile("/etc/device.properties", "RDK_PROFILE=STB\n");
+                m_cecSettingsProvisioned = writeFile(CEC_SETTING_ENABLED_FILE, "{\"cecEnabled\":false,\"cecOTPEnabled\":false,\"cecOSDName\":\"TV Box\",\"cecVendorId\":6651}");
+            }
+        }
+
+        ScopedLifecycleFiles(const ScopedLifecycleFiles&) = delete;
+        ScopedLifecycleFiles& operator=(const ScopedLifecycleFiles&) = delete;
+
+        ~ScopedLifecycleFiles()
+        {
+            if (!m_restored) {
+                if (m_cecSettingsSnapshotCaptured) {
+                    restoreFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents);
+                }
+                if (m_devicePropertiesSnapshotCaptured) {
+                    restoreFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents);
+                }
+                removeCreatedDirectory(m_cecSettingsDirectoryCreated, m_cecSettingsDirectoryPath);
+            }
+        }
+
+        bool IsValid() const
+        {
+            return m_devicePropertiesSnapshotCaptured && m_cecSettingsSnapshotCaptured && m_devicePropertiesProvisioned && m_cecSettingsProvisioned;
+        }
+
+        bool Restore()
+        {
+            if (!m_devicePropertiesSnapshotCaptured || !m_cecSettingsSnapshotCaptured) {
+                return false;
+            }
+
+            if (!m_restored) {
+                const bool cecSettingsRestored = restoreFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents);
+                const bool devicePropertiesRestored = restoreFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents);
+                removeCreatedDirectory(m_cecSettingsDirectoryCreated, m_cecSettingsDirectoryPath);
+                m_restoreSucceeded = cecSettingsRestored && devicePropertiesRestored;
+                m_restored = true;
+            }
+
+            return m_restoreSucceeded;
+        }
+
+    private:
+        bool m_devicePropertiesWasPresent;
+        std::string m_devicePropertiesContents;
+        bool m_devicePropertiesSnapshotCaptured;
+        bool m_cecSettingsWasPresent;
+        std::string m_cecSettingsContents;
+        bool m_cecSettingsSnapshotCaptured;
+        bool m_cecSettingsDirectoryCreated;
+        std::string m_cecSettingsDirectoryPath;
+        bool m_devicePropertiesProvisioned;
+        bool m_cecSettingsProvisioned;
+        bool m_restored;
+        bool m_restoreSucceeded;
+    };
+
+    // Local stack-safe connection double used to drive the private remote-connection notification sink.
+    class RemoteConnectionDouble final : public RPC::IRemoteConnection {
+    public:
+        RemoteConnectionDouble()
+            : m_id(0)
+            , m_throwOnTerminate(false)
+            , m_terminateCalls(0)
+            , m_postMortemCalls(0)
+            , m_referenceCount(1)
+            , m_releaseCalls(0)
+        {
+        }
+
+        void SetId(const uint32_t id)
+        {
+            m_id = id;
+        }
+
+        void SetThrowOnTerminate(const bool throwOnTerminate)
+        {
+            m_throwOnTerminate = throwOnTerminate;
+        }
+
+        uint32_t TerminateCalls() const
+        {
+            return m_terminateCalls;
+        }
+
+        uint32_t ReleaseCalls() const
+        {
+            return m_releaseCalls;
+        }
+
+        uint32_t Id() const override
+        {
+            return m_id;
+        }
+
+        uint32_t RemoteId() const override
+        {
+            return 0;
+        }
+
+        void* Acquire(const uint32_t, const string&, const uint32_t, const uint32_t) override
+        {
+            return nullptr;
+        }
+
+        void Terminate() override
+        {
+            ++m_terminateCalls;
+            if (m_throwOnTerminate) {
+                throw std::exception();
+            }
+        }
+
+        uint32_t Launch() override
+        {
+            return Core::ERROR_NONE;
+        }
+
+        void PostMortem() override
+        {
+            ++m_postMortemCalls;
+        }
+
+        void* QueryInterface(const uint32_t interfaceNumber) override
+        {
+            void* result = nullptr;
+
+            if (interfaceNumber == RPC::IRemoteConnection::ID) {
+                result = static_cast<RPC::IRemoteConnection*>(this);
+            } else if (interfaceNumber == Core::IUnknown::ID) {
+                result = static_cast<Core::IUnknown*>(this);
+            }
+
+            if (result != nullptr) {
+                AddRef();
+            }
+
+            return result;
+        }
+
+        void AddRef() const override
+        {
+            ++m_referenceCount;
+        }
+
+        uint32_t Release() const override
+        {
+            ++m_releaseCalls;
+            if (m_referenceCount > 0) {
+                --m_referenceCount;
+            }
+            return m_referenceCount;
+        }
+
+    private:
+        uint32_t m_id;
+        bool m_throwOnTerminate;
+        uint32_t m_terminateCalls;
+        uint32_t m_postMortemCalls;
+        mutable uint32_t m_referenceCount;
+        mutable uint32_t m_releaseCalls;
+    };
+
+    // clang-format off
 	static void CreateCecSettingsFile(const std::string& filePath, bool cecEnabled = true, bool cecOTPEnabled = true, const std::string& osdName = "TV Box", unsigned int vendorId = 0x0019FB)
 	{
 		Core::File file(filePath);
@@ -120,6 +391,16 @@ namespace
 		edidVec[9] = 0x6D;
 		return edidVec;
 	}
+    // clang-format on
+
+    static void CaptureRemoteConnectionNotification(COMLinkMock& comLinkMock, RPC::IRemoteConnection::INotification*& notification)
+    {
+        EXPECT_CALL(comLinkMock, Register(::testing::Matcher<RPC::IRemoteConnection::INotification*>(::testing::_)))
+            .WillOnce(::testing::Invoke(
+                [&notification](RPC::IRemoteConnection::INotification* registeredNotification) {
+                    notification = registeredNotification;
+                }));
+    }
 }
 
 typedef enum : uint32_t {
@@ -513,14 +794,30 @@ protected:
 
 class HdmiCecSourceSettingsTest : public HdmiCecSourceTest {
 protected:
+    bool m_devicePropertiesPresent;
+    std::string m_devicePropertiesContents;
+
     HdmiCecSourceSettingsTest()
         : HdmiCecSourceTest()
+        , m_devicePropertiesPresent(false)
+        , m_devicePropertiesContents()
     {
         
     }
     virtual ~HdmiCecSourceSettingsTest() override
     {
         removeFile(CEC_SETTING_ENABLED_FILE);
+    }
+
+    void SetUp() override
+    {
+        ASSERT_TRUE(readFile("/etc/device.properties", m_devicePropertiesPresent, m_devicePropertiesContents));
+        ASSERT_TRUE(writeFile("/etc/device.properties", "RDK_PROFILE=STB\n"));
+    }
+
+    void TearDown() override
+    {
+        EXPECT_TRUE(restoreFile("/etc/device.properties", m_devicePropertiesPresent, m_devicePropertiesContents));
     }
 };
 
@@ -1672,6 +1969,222 @@ TEST_F(HdmiCecSourceInitializedEventTest, giveDeviceVendorIdProcess_sendfailure)
 
     Plugin::HdmiCecSourceProcessor proc(Connection::getInstance());
     EXPECT_NO_THROW(proc.process(giveDeviceVendorID, header));     
+}
+
+TEST_F(HdmiCecSourceTest, Deactivated_MatchingConnectionId)
+{
+    ScopedLifecycleFiles lifecycleFiles;
+    ASSERT_TRUE(lifecycleFiles.IsValid());
+
+    RPC::IRemoteConnection::INotification* notification = nullptr;
+    CaptureRemoteConnectionNotification(comLinkMock, notification);
+
+    const string initializationResult(plugin->Initialize(&service));
+    EXPECT_EQ(string(""), initializationResult);
+    EXPECT_NE(nullptr, notification);
+
+    if (initializationResult.empty() && (notification != nullptr)) {
+        RemoteConnectionDouble remoteConnection;
+        remoteConnection.SetId(0);
+        Core::Event deactivationDispatched(false, true);
+
+        EXPECT_CALL(service, Deactivate(PluginHost::IShell::FAILURE))
+            .WillOnce(::testing::Invoke(
+                [&deactivationDispatched](const PluginHost::IShell::reason) -> Core::hresult {
+                    deactivationDispatched.SetEvent();
+                    return Core::ERROR_NONE;
+                }));
+
+        // Invoke the callback directly, then wait on delivery rather than using a wall-clock delay.
+        Core::IWorkerPool::Assign(&(*workerPool));
+        workerPool->Run();
+        notification->Deactivated(&remoteConnection);
+        EXPECT_EQ(Core::ERROR_NONE, deactivationDispatched.Lock());
+        workerPool->Stop();
+        Core::IWorkerPool::Assign(nullptr);
+
+        EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(&service));
+    }
+
+    if (initializationResult.empty()) {
+        plugin->Deinitialize(&service);
+    }
+    EXPECT_TRUE(lifecycleFiles.Restore());
+}
+
+TEST_F(HdmiCecSourceTest, Deactivated_MismatchedConnectionId)
+{
+    ScopedLifecycleFiles lifecycleFiles;
+    ASSERT_TRUE(lifecycleFiles.IsValid());
+
+    RPC::IRemoteConnection::INotification* notification = nullptr;
+    CaptureRemoteConnectionNotification(comLinkMock, notification);
+
+    const string initializationResult(plugin->Initialize(&service));
+    EXPECT_EQ(string(""), initializationResult);
+    EXPECT_NE(nullptr, notification);
+
+    if (initializationResult.empty() && (notification != nullptr)) {
+        RemoteConnectionDouble remoteConnection;
+        remoteConnection.SetId(1);
+
+        EXPECT_CALL(service, Deactivate(::testing::_)).Times(0);
+        EXPECT_NO_THROW(notification->Deactivated(&remoteConnection));
+        EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(&service));
+    }
+
+    if (initializationResult.empty()) {
+        plugin->Deinitialize(&service);
+    }
+    EXPECT_TRUE(lifecycleFiles.Restore());
+}
+
+TEST_F(HdmiCecSourceTest, Activated_RemoteConnection)
+{
+    ScopedLifecycleFiles lifecycleFiles;
+    ASSERT_TRUE(lifecycleFiles.IsValid());
+
+    RPC::IRemoteConnection::INotification* notification = nullptr;
+    CaptureRemoteConnectionNotification(comLinkMock, notification);
+
+    const string initializationResult(plugin->Initialize(&service));
+    EXPECT_EQ(string(""), initializationResult);
+    EXPECT_NE(nullptr, notification);
+
+    if (initializationResult.empty() && (notification != nullptr)) {
+        RemoteConnectionDouble remoteConnection;
+        remoteConnection.SetId(0);
+        EXPECT_NO_THROW(notification->Activated(&remoteConnection));
+    }
+
+    if (initializationResult.empty()) {
+        plugin->Deinitialize(&service);
+    }
+    EXPECT_TRUE(lifecycleFiles.Restore());
+}
+
+TEST_F(HdmiCecSourceTest, QueryInterface_HdmiCecSourceNotification)
+{
+    ScopedLifecycleFiles lifecycleFiles;
+    ASSERT_TRUE(lifecycleFiles.IsValid());
+
+    RPC::IRemoteConnection::INotification* notification = nullptr;
+    CaptureRemoteConnectionNotification(comLinkMock, notification);
+
+    const string initializationResult(plugin->Initialize(&service));
+    EXPECT_EQ(string(""), initializationResult);
+    EXPECT_NE(nullptr, notification);
+
+    if (initializationResult.empty() && (notification != nullptr)) {
+        void* result = notification->QueryInterface(Exchange::IHdmiCecSource::INotification::ID);
+        EXPECT_NE(nullptr, result);
+        if (result != nullptr) {
+            static_cast<Exchange::IHdmiCecSource::INotification*>(result)->Release();
+        }
+    }
+
+    if (initializationResult.empty()) {
+        plugin->Deinitialize(&service);
+    }
+    EXPECT_TRUE(lifecycleFiles.Restore());
+}
+
+TEST_F(HdmiCecSourceTest, QueryInterface_RemoteConnectionNotification)
+{
+    ScopedLifecycleFiles lifecycleFiles;
+    ASSERT_TRUE(lifecycleFiles.IsValid());
+
+    RPC::IRemoteConnection::INotification* notification = nullptr;
+    CaptureRemoteConnectionNotification(comLinkMock, notification);
+
+    const string initializationResult(plugin->Initialize(&service));
+    EXPECT_EQ(string(""), initializationResult);
+    EXPECT_NE(nullptr, notification);
+
+    if (initializationResult.empty() && (notification != nullptr)) {
+        void* result = notification->QueryInterface(RPC::IRemoteConnection::INotification::ID);
+        EXPECT_NE(nullptr, result);
+        if (result != nullptr) {
+            static_cast<RPC::IRemoteConnection::INotification*>(result)->Release();
+        }
+    }
+
+    if (initializationResult.empty()) {
+        plugin->Deinitialize(&service);
+    }
+    EXPECT_TRUE(lifecycleFiles.Restore());
+}
+
+TEST_F(HdmiCecSourceTest, QueryInterface_Unsupported)
+{
+    ScopedLifecycleFiles lifecycleFiles;
+    ASSERT_TRUE(lifecycleFiles.IsValid());
+
+    RPC::IRemoteConnection::INotification* notification = nullptr;
+    CaptureRemoteConnectionNotification(comLinkMock, notification);
+
+    const string initializationResult(plugin->Initialize(&service));
+    EXPECT_EQ(string(""), initializationResult);
+    EXPECT_NE(nullptr, notification);
+
+    if (initializationResult.empty() && (notification != nullptr)) {
+        EXPECT_EQ(nullptr, notification->QueryInterface(0xFFFFFFFF));
+    }
+
+    if (initializationResult.empty()) {
+        plugin->Deinitialize(&service);
+    }
+    EXPECT_TRUE(lifecycleFiles.Restore());
+}
+
+TEST_F(HdmiCecSourceTest, Initialize_PluginUnavailable)
+{
+    ScopedLifecycleFiles lifecycleFiles;
+    ASSERT_TRUE(lifecycleFiles.IsValid());
+
+    ON_CALL(service, ConfigLine())
+        .WillByDefault(::testing::Return("{\"root\":{\"mode\":\"Local\"}}"));
+
+    ON_CALL(comLinkMock, Instantiate(::testing::_, ::testing::_, ::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [](const RPC::Object&, const uint32_t, uint32_t& connectionId) -> void* {
+                connectionId = 73;
+                return nullptr;
+            }));
+    EXPECT_CALL(comLinkMock, Instantiate(::testing::_, ::testing::_, ::testing::_))
+        .Times(1);
+
+    const string initializationResult(plugin->Initialize(&service));
+    EXPECT_EQ(string("HdmiCecSource plugin is not available"), initializationResult);
+
+    if (initializationResult.empty()) {
+        plugin->Deinitialize(&service);
+    }
+    EXPECT_TRUE(lifecycleFiles.Restore());
+}
+
+TEST_F(HdmiCecSourceTest, Deinitialize_RemoteConnectionTerminateThrows)
+{
+    ScopedLifecycleFiles lifecycleFiles;
+    ASSERT_TRUE(lifecycleFiles.IsValid());
+
+    const string initializationResult(plugin->Initialize(&service));
+    EXPECT_EQ(string(""), initializationResult);
+
+    if (initializationResult.empty()) {
+        RemoteConnectionDouble remoteConnection;
+        remoteConnection.SetId(0);
+        remoteConnection.SetThrowOnTerminate(true);
+
+        EXPECT_CALL(comLinkMock, RemoteConnection(0))
+            .WillOnce(::testing::Return(&remoteConnection));
+
+        EXPECT_NO_THROW(plugin->Deinitialize(&service));
+        EXPECT_EQ(1u, remoteConnection.TerminateCalls());
+        EXPECT_EQ(1u, remoteConnection.ReleaseCalls());
+    }
+
+    EXPECT_TRUE(lifecycleFiles.Restore());
 }
 
 TEST_F(HdmiCecSourceInitializedEventTest, GiveDevicePowerStatusProcess_sendfailure){
