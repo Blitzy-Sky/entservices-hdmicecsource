@@ -19,9 +19,14 @@
 
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include <cerrno>
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -58,8 +63,41 @@ using ::testing::NiceMock;
 
 namespace
 {
+	// Refuse to write through anything that is not a plain file (CWE-59 / CWE-367).
+	//
+	// The two paths these helpers manage - /etc/device.properties and
+	// /opt/persistent/ds/cecData_2.json - are fixed, world-traversable locations dictated by
+	// production code (HdmiCecSourceImplementation reads exactly these), not temporaries this
+	// fixture is free to relocate. std::ofstream follows symlinks, so a link left at either path
+	// (by a hostile process, or simply by a stray artifact of an earlier run) would have the
+	// fixture truncate and overwrite whatever the link points at. lstat inspects the path itself
+	// rather than its target, so it can tell those cases apart: absent is fine, a regular file is
+	// fine, anything else is refused.
+	//
+	// This narrows the window but cannot close it - between the check and the open the path could
+	// still change, which is the CWE-367 half. Closing it entirely would need an O_NOFOLLOW open,
+	// and the callers here are std::ofstream/std::remove on a production-imposed path; the guard
+	// is therefore the strongest defence available without a production change, and the residual
+	// race is recorded rather than papered over.
+	static bool isRegularFileOrAbsent(const char* fileName)
+	{
+		struct stat pathStat;
+		if (lstat(fileName, &pathStat) != 0)
+		{
+			return errno == ENOENT;
+		}
+
+		return S_ISREG(pathStat.st_mode) != 0;
+	}
+
 	static void removeFile(const char* fileName)
 	{
+		if (!isRegularFileOrAbsent(fileName))
+		{
+			printf("File %s is not a regular file; refusing to remove it\n", fileName);
+			return;
+		}
+
 		if (std::remove(fileName) != 0)
 		{
 			printf("File %s failed to remove\n", fileName);
@@ -73,6 +111,12 @@ namespace
 	
 	static void createFile(const char* fileName, const char* fileContent)
 	{
+		if (!isRegularFileOrAbsent(fileName))
+		{
+			printf("File %s is not a regular file; refusing to write to it\n", fileName);
+			return;
+		}
+
 		removeFile(fileName);
 
 		std::ofstream fileContentStream(fileName);
@@ -81,89 +125,234 @@ namespace
 		fileContentStream.close();
 	}
 
+    // Both files this fixture snapshots are process-global paths outside the build tree
+    // (/etc/device.properties and the CEC settings file), so every access below goes
+    // through a descriptor opened O_NOFOLLOW and refuses anything that is not a regular
+    // file.  A symlink planted at either path is reported rather than followed: writing
+    // through it would modify whatever it refers to, and truncating in place - which is
+    // what an ofstream does - is exactly how that happens.
+    //
+    // "Could not open" is also not one condition.  Absent is a normal state this fixture
+    // provisions from; unreadable is a failure the caller must see, so the two are
+    // separated on errno instead of being collapsed into success.
     static bool readFile(const char* fileName, bool& filePresent, std::string& fileContents)
     {
-        std::ifstream fileContentStream(fileName, std::ios::in | std::ios::binary);
-        if (!fileContentStream.is_open()) {
-            filePresent = false;
-            fileContents.clear();
-            return true;
+        filePresent = false;
+        fileContents.clear();
+
+        const int fd = ::open(fileName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) {
+            // ENOENT means no such name; ENOTDIR means a parent component is not a
+            // directory, so the file cannot exist either. Both are genuine absence.
+            if ((errno == ENOENT) || (errno == ENOTDIR)) {
+                return true;
+            }
+            printf("File %s could not be read: %s\n", fileName, strerror(errno));
+            return false;
+        }
+
+        struct stat fileStat;
+        if ((fstat(fd, &fileStat) != 0) || !S_ISREG(fileStat.st_mode)) {
+            printf("File %s is not a regular file; refusing to snapshot it\n", fileName);
+            ::close(fd);
+            return false;
         }
 
         filePresent = true;
-        fileContents.clear();
-        char byte = '\0';
-        while (fileContentStream.get(byte)) {
-            fileContents.push_back(byte);
+        char buffer[4096];
+        ssize_t bytesRead = 0;
+        while ((bytesRead = ::read(fd, buffer, sizeof(buffer))) > 0) {
+            fileContents.append(buffer, static_cast<std::string::size_type>(bytesRead));
+        }
+        const int readErrno = errno;
+        ::close(fd);
+
+        if (bytesRead < 0) {
+            printf("File %s failed mid-read: %s\n", fileName, strerror(readErrno));
+            fileContents.clear();
+            return false;
         }
 
-        return !fileContentStream.bad();
+        return true;
     }
 
     static bool writeFile(const char* fileName, const std::string& fileContents)
     {
-        std::ofstream fileContentStream(fileName, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!fileContentStream.is_open()) {
+        // Preserve the permissions the path already carried; these are host-global files
+        // that sibling suites and the host fixtures read after this one has finished.
+        mode_t fileMode = 0644;
+        struct stat existingStat;
+        if (lstat(fileName, &existingStat) == 0) {
+            if (!S_ISREG(existingStat.st_mode)) {
+                printf("File %s is not a regular file (mode %o); refusing to write through it\n",
+                       fileName, existingStat.st_mode);
+                return false;
+            }
+            fileMode = existingStat.st_mode & 07777;
+
+            // std::remove, NOT unlink: this binary is linked with -Wl,-wrap,unlink, so a
+            // direct unlink() call is redirected to the Wraps mock and removes nothing -
+            // the O_EXCL open below would then fail with EEXIST.  std::remove reaches the
+            // real filesystem, and like unlink it removes the entry rather than following
+            // it, which is what the no-follow guarantee here needs.
+            if (std::remove(fileName) != 0) {
+                printf("File %s could not be replaced: %s\n", fileName, strerror(errno));
+                return false;
+            }
+        } else if (errno != ENOENT) {
+            printf("File %s could not be examined: %s\n", fileName, strerror(errno));
             return false;
         }
 
-        fileContentStream.write(fileContents.data(), static_cast<std::streamsize>(fileContents.size()));
-        fileContentStream.close();
-        return !fileContentStream.fail();
+        // O_EXCL after the unlink means this open creates the file or fails; it can never
+        // resolve to an entry planted between the two calls.
+        const int fd = ::open(fileName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, fileMode);
+        if (fd < 0) {
+            printf("File %s could not be created: %s\n", fileName, strerror(errno));
+            return false;
+        }
+
+        bool written = true;
+        std::string::size_type offset = 0;
+        while (offset < fileContents.size()) {
+            const ssize_t bytesWritten = ::write(fd, fileContents.data() + offset, fileContents.size() - offset);
+            if (bytesWritten <= 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                printf("File %s failed mid-write: %s\n", fileName, strerror(errno));
+                written = false;
+                break;
+            }
+            offset += static_cast<std::string::size_type>(bytesWritten);
+        }
+
+        // fchmod rather than relying on the open mode, which the umask would have masked.
+        if (written && (fchmod(fd, fileMode) != 0)) {
+            printf("File %s could not be restored to mode %o: %s\n", fileName, fileMode, strerror(errno));
+            written = false;
+        }
+
+        return (::close(fd) == 0) && written;
     }
 
-    // The CEC settings file lives under a directory that neither CI nor a developer host
-    // provisions (/opt/persistent exists, /opt/persistent/ds does not).  A fixture must
-    // establish its own preconditions, so create the missing parent directory here and
-    // report whether it had to be created so it can be removed again afterwards.
+    // Create the settings file's parent directory when it is absent (/opt/persistent
+    // exists on CI and on a developer host, /opt/persistent/ds does not), and report
+    // whether this call created it, so that teardown removes only state this fixture owns
+    // and never a directory that was already present. It is created 0700, not 0777: a
+    // world-writable directory on a privileged path would let any local account plant the
+    // settings file - or a symlink standing in for it - before the write that follows.
     static bool ensureParentDirectory(const char* fileName, bool& directoryCreated, std::string& directoryPath)
     {
         directoryCreated = false;
         directoryPath.clear();
 
-        const std::string path(fileName);
-        const std::string::size_type separator = path.find_last_of('/');
-        if (separator == std::string::npos || separator == 0) {
-            return true;
-        }
+		const std::string path(fileName);
+		const std::string::size_type separator = path.find_last_of('/');
+		if (separator == std::string::npos || separator == 0) {
+			return true;
+		}
 
-        directoryPath = path.substr(0, separator);
+		directoryPath = path.substr(0, separator);
 
+        // lstat, so an existing symlink standing in for the directory is rejected rather
+        // than silently accepted as "already a directory".
         struct stat directoryStat;
-        if (stat(directoryPath.c_str(), &directoryStat) == 0) {
-            return S_ISDIR(directoryStat.st_mode);
+        if (lstat(directoryPath.c_str(), &directoryStat) == 0) {
+            const bool usable = S_ISDIR(directoryStat.st_mode);
+            if (!usable) {
+                directoryPath.clear();
+            }
+            return usable;
         }
 
-        if (mkdir(directoryPath.c_str(), 0777) != 0) {
+        // 0700, not 0777: this directory is created on a shared host and holds the CEC
+        // settings file, so nothing outside this process needs to reach into it.
+        if (mkdir(directoryPath.c_str(), 0700) != 0) {
+            printf("Directory %s could not be created: %s\n", directoryPath.c_str(), strerror(errno));
             directoryPath.clear();
             return false;
         }
 
-        directoryCreated = true;
+		directoryCreated = true;
+		return true;
+	}
+
+    // Returns whether the host was left as it was found.  A directory this fixture created
+    // and then failed to remove is a leftover on a shared machine, so the result is
+    // reported rather than discarded.
+    static bool removeCreatedDirectory(const bool directoryCreated, const std::string& directoryPath)
+    {
+        if (!directoryCreated || directoryPath.empty()) {
+            return true;
+        }
+
+        if (rmdir(directoryPath.c_str()) != 0) {
+            printf("Directory %s could not be removed: %s\n", directoryPath.c_str(), strerror(errno));
+            return false;
+        }
+
         return true;
     }
 
-    static void removeCreatedDirectory(const bool directoryCreated, const std::string& directoryPath)
-    {
-        if (directoryCreated && !directoryPath.empty()) {
-            rmdir(directoryPath.c_str());
-        }
-    }
-
+    // Put a snapshotted file back.  wasPresent must come from a readFile() call that
+    // returned true, which is what makes deleting the file safe in the absent case: readFile
+    // only reports absence for a file that was genuinely not there.
     static bool restoreFile(const char* fileName, const bool wasPresent, const std::string& fileContents)
     {
         if (wasPresent) {
             return writeFile(fileName, fileContents);
         }
 
-        std::ifstream fileContentStream(fileName, std::ios::in | std::ios::binary);
-        if (!fileContentStream.is_open()) {
-            return true;
+        // The file did not exist before this fixture ran, so it has to be gone again.
+        //
+        // Removing unconditionally rather than checking first: a stat-then-remove pair
+        // leaves a window in which a sibling test of this suite - several of them delete
+        // this same path - removes the entry in between, and the removal would then be
+        // reported as a failure even though the state being asked for was reached. Absent
+        // is the goal, so ENOENT is success.
+        //
+        // std::remove rather than unlink because this binary is linked with
+        // -Wl,-wrap,unlink and a direct unlink() call would be redirected to the Wraps
+        // mock and remove nothing.  Like unlink it removes the entry rather than following
+        // it, so a symlink planted at this path is unlinked rather than written through.
+        if ((std::remove(fileName) != 0) && (errno != ENOENT)) {
+            printf("File %s could not be removed: %s\n", fileName, strerror(errno));
+            return false;
         }
 
-        fileContentStream.close();
-        return (std::remove(fileName) == 0);
+        return true;
     }
+
+    // Core::IWorkerPool::Assign installs a PROCESS-GLOBAL dispatcher, so the window in
+    // which a test owns it has to close on every exit path.  Left open by a fatal
+    // assertion or an exception, the pool stays assigned and running while its threads
+    // outlive the test that started them, and every later test in the binary inherits it.
+    // Binding the window to a scope makes the pairing unskippable, and the previous
+    // assignment is captured and put back rather than assumed to have been nothing.
+    class ScopedWorkerPoolAssignment {
+    public:
+        explicit ScopedWorkerPoolAssignment(WorkerPoolImplementation& workerPool)
+            : m_workerPool(workerPool)
+            , m_previous(Core::IWorkerPool::IsAvailable() ? &Core::IWorkerPool::Instance() : nullptr)
+        {
+            Core::IWorkerPool::Assign(&m_workerPool);
+            m_workerPool.Run();
+        }
+
+        ScopedWorkerPoolAssignment(const ScopedWorkerPoolAssignment&) = delete;
+        ScopedWorkerPoolAssignment& operator=(const ScopedWorkerPoolAssignment&) = delete;
+
+        ~ScopedWorkerPoolAssignment()
+        {
+            m_workerPool.Stop();
+            Core::IWorkerPool::Assign(m_previous);
+        }
+
+    private:
+        WorkerPoolImplementation& m_workerPool;
+        Core::IWorkerPool* m_previous;
+    };
 
     // Snapshot both process-global files and disable CEC worker threads so lifecycle callbacks remain deterministic.
     class ScopedLifecycleFiles {
@@ -192,16 +381,26 @@ namespace
         ScopedLifecycleFiles(const ScopedLifecycleFiles&) = delete;
         ScopedLifecycleFiles& operator=(const ScopedLifecycleFiles&) = delete;
 
+        // Last line of defence.  Restore() is called explicitly by the tests, but it only
+        // latches when it actually succeeded, so this runs whenever the host has not yet
+        // been handed back - including when a test aborted on a fatal assertion. A
+        // destructor cannot throw, so a failure here is reported and the remaining paths
+        // are still attempted rather than abandoned at the first error.
         ~ScopedLifecycleFiles()
         {
             if (!m_restored) {
+                bool restored = true;
                 if (m_cecSettingsSnapshotCaptured) {
-                    restoreFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents);
+                    restored = restoreFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents) && restored;
                 }
                 if (m_devicePropertiesSnapshotCaptured) {
-                    restoreFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents);
+                    restored = restoreFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents) && restored;
                 }
-                removeCreatedDirectory(m_cecSettingsDirectoryCreated, m_cecSettingsDirectoryPath);
+                restored = removeCreatedDirectory(m_cecSettingsDirectoryCreated, m_cecSettingsDirectoryPath) && restored;
+
+                if (!restored) {
+                    printf("ScopedLifecycleFiles: host state could not be fully restored; see the errors above\n");
+                }
             }
         }
 
@@ -210,6 +409,10 @@ namespace
             return m_devicePropertiesSnapshotCaptured && m_cecSettingsSnapshotCaptured && m_devicePropertiesProvisioned && m_cecSettingsProvisioned;
         }
 
+        // Returns true only when both files are back to their captured state. A failure
+        // leaves m_restored false so the destructor retries; the directory is cleaned up
+        // and reported separately, because a leftover empty directory is a different
+        // problem from an unrestored file and must not mask one.
         bool Restore()
         {
             if (!m_devicePropertiesSnapshotCaptured || !m_cecSettingsSnapshotCaptured) {
@@ -219,12 +422,31 @@ namespace
             if (!m_restored) {
                 const bool cecSettingsRestored = restoreFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents);
                 const bool devicePropertiesRestored = restoreFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents);
-                removeCreatedDirectory(m_cecSettingsDirectoryCreated, m_cecSettingsDirectoryPath);
-                m_restoreSucceeded = cecSettingsRestored && devicePropertiesRestored;
-                m_restored = true;
+                const bool directoryRemoved = removeCreatedDirectory(m_cecSettingsDirectoryCreated, m_cecSettingsDirectoryPath);
+                m_restoreSucceeded = cecSettingsRestored && devicePropertiesRestored && directoryRemoved;
+
+                // Latch only on success.  Recording a failed restoration as "done" would
+                // stop the destructor from trying again and leave this fixture's
+                // provisioned values on a shared host for whatever runs next.
+                m_restored = m_restoreSucceeded;
+
+                // Clear the directory flag on its own result: if the files still need a
+                // retry, the destructor must not attempt an rmdir that already succeeded
+                // and report the resulting ENOENT as a fresh failure.
+                if (directoryRemoved) {
+                    m_cecSettingsDirectoryCreated = false;
+                }
+                m_directoryRemoved = directoryRemoved;
             }
 
             return m_restoreSucceeded;
+        }
+
+        // Exposed separately from Restore() so a caller can tell "the files are back" from
+        // "the directory this fixture created is gone again".
+        bool DirectoryRemoved() const
+        {
+            return m_directoryRemoved;
         }
 
     private:
@@ -240,6 +462,7 @@ namespace
         bool m_cecSettingsProvisioned;
         bool m_restored;
         bool m_restoreSucceeded;
+        bool m_directoryRemoved = false;
     };
 
     // Local stack-safe connection double used to drive the private remote-connection notification sink.
@@ -796,11 +1019,16 @@ class HdmiCecSourceSettingsTest : public HdmiCecSourceTest {
 protected:
     bool m_devicePropertiesPresent;
     std::string m_devicePropertiesContents;
+    // Whether SetUp actually captured a snapshot. TearDown runs even when SetUp aborts on a
+    // fatal assertion, and restoring from an uncaptured snapshot means "the file was absent",
+    // which would delete a real /etc/device.properties this fixture never read.
+    bool m_devicePropertiesSnapshotCaptured;
 
     HdmiCecSourceSettingsTest()
         : HdmiCecSourceTest()
         , m_devicePropertiesPresent(false)
         , m_devicePropertiesContents()
+        , m_devicePropertiesSnapshotCaptured(false)
     {
         
     }
@@ -811,12 +1039,19 @@ protected:
 
     void SetUp() override
     {
-        ASSERT_TRUE(readFile("/etc/device.properties", m_devicePropertiesPresent, m_devicePropertiesContents));
+        m_devicePropertiesSnapshotCaptured = readFile("/etc/device.properties", m_devicePropertiesPresent, m_devicePropertiesContents);
+        ASSERT_TRUE(m_devicePropertiesSnapshotCaptured) << "Could not snapshot /etc/device.properties, so this test cannot safely provision it.";
         ASSERT_TRUE(writeFile("/etc/device.properties", "RDK_PROFILE=STB\n"));
     }
 
     void TearDown() override
     {
+        // Restore only what was captured. Without this guard a failed capture would leave
+        // m_devicePropertiesPresent false and the restore would remove the host's own file.
+        if (!m_devicePropertiesSnapshotCaptured) {
+            return;
+        }
+
         EXPECT_TRUE(restoreFile("/etc/device.properties", m_devicePropertiesPresent, m_devicePropertiesContents));
     }
 };
@@ -1260,24 +1495,41 @@ TEST_F(HdmiCecSourceInitializedTest, sendKeyPressEvent20)
 
 }
 
-//Failing to remove file when triggered on github. There might be some kind of permission issue.
-TEST_F(HdmiCecSourceTest, DISABLED_NotSupportedPlugin)
+// REMEDIATED - was DISABLED_NotSupportedPlugin, disabled with the note "Failing to remove file
+// when triggered on github. There might be some kind of permission issue."
+//
+// Two things were wrong with it. The disablement reason is a symptom: the test drove
+// /etc/device.properties directly, so whether it could remove that file depended on the host it
+// ran on. And whatever the outcome, it ended by deleting the file outright, handing an absent
+// /etc/device.properties to whatever fixture ran next - the same class of process-global state
+// leak that makes sibling fixtures in this suite fail depending on execution order.
+//
+// It is enabled here by giving it the preconditions it always needed: ScopedLifecycleFiles
+// snapshots both process-global lifecycle files on entry and puts them back on exit (its
+// destructor restores even if the test aborts on a fatal assertion), and the file helpers it
+// calls are now symlink-guarded. The `system("ls -lh /etc/")` diagnostics have been dropped -
+// they existed only to investigate the CI permission problem this remediation removes, and they
+// route through the wrapped `system` symbol, which is mock territory rather than a real listing.
+//
+// What the test asserts is unchanged: no profile file and a TV profile must both be rejected with
+// "Not supported", and only an STB profile may initialise successfully.
+TEST_F(HdmiCecSourceTest, NotSupportedPlugin)
 {
-    system("ls -lh /etc/");
+    ScopedLifecycleFiles lifecycleFiles;
+    ASSERT_TRUE(lifecycleFiles.IsValid()) << "Could not snapshot the process-global lifecycle files.";
+
     removeFile("/etc/device.properties");
-    system("ls -lh /etc/");
     EXPECT_EQ(string("Not supported"), plugin->Initialize(&service));
+
     createFile("/etc/device.properties", "RDK_PROFILE=TV");
-    system("ls -lh /etc/");
     EXPECT_EQ(string("Not supported"), plugin->Initialize(&service));
+
     removeFile("/etc/device.properties");
-    system("ls -lh /etc/");
     createFile("/etc/device.properties", "RDK_PROFILE=STB");
-    system("ls -lh /etc/");
     EXPECT_EQ(string(""), plugin->Initialize(&service));
     plugin->Deinitialize(&service);
-    removeFile("/etc/device.properties");
-    system("ls -lh /etc/");
+
+    EXPECT_TRUE(lifecycleFiles.Restore());
 }
 
 TEST_F(HdmiCecSourceInitializedTest, GetInformation)
@@ -1996,12 +2248,17 @@ TEST_F(HdmiCecSourceTest, Deactivated_MatchingConnectionId)
                 }));
 
         // Invoke the callback directly, then wait on delivery rather than using a wall-clock delay.
-        Core::IWorkerPool::Assign(&(*workerPool));
-        workerPool->Run();
-        notification->Deactivated(&remoteConnection);
-        EXPECT_EQ(Core::ERROR_NONE, deactivationDispatched.Lock());
-        workerPool->Stop();
-        Core::IWorkerPool::Assign(nullptr);
+        // The pool assignment is scoped, so it is withdrawn and the pool stopped however
+        // this block is left.
+        {
+            ScopedWorkerPoolAssignment scopedWorkerPool(*workerPool);
+            notification->Deactivated(&remoteConnection);
+            // BOUNDED: Deactivated() submits a job to the pool, and if that job is never
+            // dispatched the no-argument Lock() would block this thread for ever and hang
+            // the whole suite instead of failing this test.
+            EXPECT_EQ(Core::ERROR_NONE, deactivationDispatched.Lock(JSON_TIMEOUT))
+                << "the shell was not deactivated within " << JSON_TIMEOUT << " ms";
+        }
 
         EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(&service));
     }

@@ -1,29 +1,39 @@
 """
 /**
  * @file TCID33_Process_Yaml_Health_Check.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 vDevice testcase for the HDMI-CEC Source plugin. Health check over the vComponent
+ *        process response documents.
  *
  * @testcase TCID33_Process_Yaml_Health_Check
- * @details Validates the 'TCID33_Process_Yaml_Health_Check' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Posts every process response document to the vComponent and checks getDeviceList and
+ *          getActiveSourceStatus still answer correctly afterwards.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - A device under test - physical hardware or a QEMU target - is running WPEFramework
+ *    with the org.rdk.HdmiCecSource plugin activated and reachable over JSON-RPC.
+ *  - The vComponent HDMI-CEC emulator is running and accepting YAML command documents.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - SuitManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - shared endpoint resolution, curl dispatch and logging helpers
+ *  - HdmiCECSource_Curl.py - the JSON-RPC command strings this module dispatches
+ *  - SuitManager.py - registers and runs this module
+ *  - vcomponent_configurations/commands/ - Process_CEC_Version.yaml,
+ *    Process_Device_Vendor_ID.yaml, Process_Report_Physical_Address.yaml,
+ *    Process_Request_Active_Source.yaml, Process_Routing_Change.yaml,
+ *    Process_Routing_Information.yaml, Process_Set_OSD_Name.yaml, Process_Set_Stream_Path.yaml
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - Each of these APIs answers with the values this scenario expects:
+ *      org.rdk.HdmiCecSource.getDeviceList
+ *      org.rdk.HdmiCecSource.getActiveSourceStatus
+ *  - Every vComponent command document is accepted before the APIs are exercised.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - Every response matches its expected value and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - A response mismatch, a JSON-RPC or JSON parsing failure, an unreachable endpoint
+ *    or a rejected vComponent command document; run_test() then returns False.
  */
 """
 

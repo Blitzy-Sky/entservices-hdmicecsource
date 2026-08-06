@@ -1,29 +1,33 @@
 """
 /**
  * @file TCID28_Invalid_VendorID_Nochange.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 vDevice testcase for the HDMI-CEC Source plugin. An invalid vendor ID must not change
+ *        the stored value.
  *
  * @testcase TCID28_Invalid_VendorID_Nochange
- * @details Validates the 'TCID28_Invalid_VendorID_Nochange' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Sets a valid vendor ID and reads it back, then sets an invalid one and checks
+ *          getVendorId still reports the valid value.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - A device under test - physical hardware or a QEMU target - is running WPEFramework
+ *    with the org.rdk.HdmiCecSource plugin activated and reachable over JSON-RPC.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - SuitManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - shared endpoint resolution, curl dispatch and logging helpers
+ *  - HdmiCECSource_Curl.py - the JSON-RPC command strings this module dispatches
+ *  - SuitManager.py - registers and runs this module
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - Each of these APIs answers with the values this scenario expects:
+ *      org.rdk.HdmiCecSource.setVendorId
+ *      org.rdk.HdmiCecSource.getVendorId
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - Every response matches its expected value and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - A response mismatch, a JSON-RPC or JSON parsing failure, an unreachable endpoint
+ *    or an unavailable device-level prerequisite; run_test() then returns False.
  */
 """
 

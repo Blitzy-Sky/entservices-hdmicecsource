@@ -1,29 +1,31 @@
 """
 /**
  * @file TCID30_Repeated_Enable_Idempotent.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 vDevice testcase for the HDMI-CEC Source plugin. Repeated enable is idempotent.
  *
  * @testcase TCID30_Repeated_Enable_Idempotent
- * @details Validates the 'TCID30_Repeated_Enable_Idempotent' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Calls setEnabled true twice and checks getEnabled reports enabled after each call.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - A device under test - physical hardware or a QEMU target - is running WPEFramework
+ *    with the org.rdk.HdmiCecSource plugin activated and reachable over JSON-RPC.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - SuitManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - shared endpoint resolution, curl dispatch and logging helpers
+ *  - HdmiCECSource_Curl.py - the JSON-RPC command strings this module dispatches
+ *  - SuitManager.py - registers and runs this module
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - Each of these APIs answers with the values this scenario expects:
+ *      org.rdk.HdmiCecSource.setEnabled
+ *      org.rdk.HdmiCecSource.getEnabled
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - Every response matches its expected value and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - A response mismatch, a JSON-RPC or JSON parsing failure, an unreachable endpoint
+ *    or an unavailable device-level prerequisite; run_test() then returns False.
  */
 """
 

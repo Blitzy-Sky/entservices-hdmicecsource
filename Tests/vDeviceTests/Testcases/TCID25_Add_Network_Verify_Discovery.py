@@ -1,29 +1,33 @@
 """
 /**
  * @file TCID25_Add_Network_Verify_Discovery.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 vDevice testcase for the HDMI-CEC Source plugin. Network add and device discovery.
  *
  * @testcase TCID25_Add_Network_Verify_Discovery
- * @details Validates the 'TCID25_Add_Network_Verify_Discovery' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Adds an emulated network topology through the vComponent and checks getDeviceList
+ *          discovers the added devices.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - A device under test - physical hardware or a QEMU target - is running WPEFramework
+ *    with the org.rdk.HdmiCecSource plugin activated and reachable over JSON-RPC.
+ *  - The vComponent HDMI-CEC emulator is running and accepting YAML command documents.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - SuitManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - shared endpoint resolution, curl dispatch and logging helpers
+ *  - HdmiCECSource_Curl.py - the JSON-RPC command strings this module dispatches
+ *  - SuitManager.py - registers and runs this module
+ *  - vcomponent_configurations/commands/ - Device_Config_Add_Network.yaml, Device_Status.yaml
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - org.rdk.HdmiCecSource.getDeviceList answers with the values this scenario expects.
+ *  - Every vComponent command document is accepted before the APIs are exercised.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - Every response matches its expected value and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - A response mismatch, a JSON-RPC or JSON parsing failure, an unreachable endpoint
+ *    or a rejected vComponent command document; run_test() then returns False.
  */
 """
 

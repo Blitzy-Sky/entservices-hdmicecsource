@@ -7,7 +7,7 @@ git clone git@github.com:rdkcentral/entservices-hdmicecsource.git
 cd entservices-hdmicecsource/Tests/vDeviceTests
 
 EXECUTION:
-with time : python3 SuitManager.py -t hdmicecsource 
+with time : python3 SuitManager.py -t hdmicecsource
 without time: python3 SuitManager.py hdmicecsource
 
 Default Actions:

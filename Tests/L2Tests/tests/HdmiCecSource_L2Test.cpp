@@ -18,10 +18,16 @@
  */
 #include "L2Tests.h"
 #include "L2TestsMock.h"
+#include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <fstream>
+#include <functional>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <thread>
+#include <vector>
+#include <set>
 #include <interfaces/IHdmiCecSource.h>
 // Used to change the power state for events
 #include <interfaces/IPowerManager.h>
@@ -105,9 +111,14 @@ typedef enum : uint32_t {
 // Notification handler for HdmiCecSource events
 class HdmiCecSourceNotificationHandler : public Exchange::IHdmiCecSource::INotification {
 private:
-    std::mutex m_mutex;
+    // mutable so the removal-payload accessor below can be const and still take the lock:
+    // OnDeviceRemoved is invoked from the plugin's threads, so an unsynchronised read of the
+    // recorded payload would be a data race.
+    mutable std::mutex m_mutex;
     std::condition_variable m_condition_variable;
     uint32_t m_event_signalled;
+    // Every logical address OnDeviceRemoved has been raised for, not just the last one.
+    std::set<int> m_removedAddresses;
 
     BEGIN_INTERFACE_MAP(Notification)
     INTERFACE_ENTRY(Exchange::IHdmiCecSource::INotification)
@@ -147,6 +158,12 @@ public:
         TEST_LOG("OnDeviceRemoved event received, logicalAddress: %d", logicalAddress);
         std::unique_lock<std::mutex> lock(m_mutex);
         m_logicalAddress = logicalAddress;
+        // Every removal payload is kept, not just the most recent one:
+        // HdmiCecSourceImplementation::removeAllCecDevices() emits one OnDeviceRemoved per
+        // present device in a single sweep, so a "last address seen" reading cannot be
+        // asserted on deterministically.
+        m_removedLogicalAddresses.push_back(logicalAddress);
+        m_removedAddresses.insert(logicalAddress);
         m_event_signalled |= ON_DEVICE_REMOVED;
         m_condition_variable.notify_one();
     }
@@ -215,12 +232,42 @@ public:
 
     bool GetActiveSourceStatus() const { return m_activeSourceStatus; }
     int GetLogicalAddress() const { return m_logicalAddress; }
+
+    /**
+     * Whether OnDeviceRemoved was raised for one specific logical address.
+     *
+     * GetLogicalAddress only remembers the most recent notification, which is not enough when
+     * production removes several devices in one sweep - removeAllCecDevices() notifies every
+     * present address in turn, so the last one reported is whichever happens to be highest, not
+     * the address under test. Every removed address is recorded here so a test can name the one
+     * it cares about.
+     */
+    bool WasRemoved(const int logicalAddress) const
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_removedAddresses.find(logicalAddress) != m_removedAddresses.end();
+    }
     int GetKeyCode() const { return m_keyCode; }
+
+    // Snapshot of every logical address OnDeviceRemoved has reported since the last clear.
+    std::vector<int> GetRemovedLogicalAddresses() const
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_removedLogicalAddresses;
+    }
+
+    void ClearRemovedLogicalAddresses()
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_removedLogicalAddresses.clear();
+        m_removedAddresses.clear();
+    }
 
 private:
     bool m_activeSourceStatus;
     int m_logicalAddress;
     int m_keyCode;
+    std::vector<int> m_removedLogicalAddresses;
 };
 
 class AsyncHandlerMock_HdmiCecSource {
@@ -249,6 +296,19 @@ protected:
 public:
     uint32_t CreateHdmiCecSourceInterfaceObject();
     uint32_t WaitForRequestStatus(uint32_t timeout_ms, HdmiCecSourceL2test_async_events_t expected_status);
+    /*
+     * Waits on the JSON-RPC side of the fixture. WaitForRequestStatus() above delegates to
+     * m_notificationHandler, which only ever sees COM-RPC notifications; the seven
+     * on<Event>(const JsonObject&) members below record into this fixture's own
+     * m_event_signalled instead, and until this helper existed nothing read that field. A test
+     * that needs to prove the JSON-RPC leg of an emission actually fired - i.e. that
+     * HdmiCecSource.h's Notification sink reached Exchange::JHdmiCecSource::Event::* - subscribes
+     * one of those members through JSONRPC::LinkType::Subscribe and then waits here.
+     * Semantics deliberately mirror HdmiCecSourceNotificationHandler::WaitForEvent: returns the
+     * matched bits and clears the accumulated set on success, returns
+     * HDMICECSOURCE_STATUS_INVALID on timeout.
+     */
+    uint32_t WaitForJsonRpcEvent(uint32_t timeout_ms, HdmiCecSourceL2test_async_events_t expected_status);
     void onActiveSourceStatusUpdated(const JsonObject& message);
     void onDeviceAdded(const JsonObject& message);
     void onDeviceInfoUpdated(const JsonObject& message);
@@ -266,6 +326,73 @@ protected:
     FrameListener* registeredListener = nullptr;
     std::vector<FrameListener*> listeners;
 
+    /**
+     * Switch CEC on so the implementation registers its FrameListener, and wait until it has.
+     *
+     * The implementation only opens the CEC connection - and therefore only calls
+     * addFrameListener - when CEC is enabled, and the enabled setting is persisted, so it is
+     * shared state that outlives the plugin and carries between tests. A test that drives inbound
+     * frames must establish that precondition itself. The state this test inherited is recorded on
+     * the first call so TearDown can hand the next test the same starting point, whichever way it
+     * was set and however this test ends.
+     *
+     * @param timeoutMs Upper bound, in milliseconds, on the wait for the registration.
+     * @return true when at least one FrameListener has been captured.
+     */
+    bool EnableCecAndAwaitFrameListener(const uint32_t timeoutMs = 5000)
+    {
+        JsonObject params, result;
+
+        if (!m_cecEntryStateCaptured
+            && InvokeServiceMethod("org.rdk.HdmiCecSource.1", "getEnabled", params, result) == Core::ERROR_NONE
+            && result.HasLabel("enabled")) {
+            m_cecEnabledOnEntry = result["enabled"].Boolean();
+            m_cecEntryStateCaptured = true;
+        }
+
+        if (!listeners.empty()) {
+            return true;
+        }
+
+        params["enabled"] = true;
+        if (InvokeServiceMethod("org.rdk.HdmiCecSource.1", "setEnabled", params, result) != Core::ERROR_NONE) {
+            return false;
+        }
+
+        const uint32_t pollIntervalMs = 20;
+        for (uint32_t waitedMs = 0; waitedMs <= timeoutMs; waitedMs += pollIntervalMs) {
+            if (!listeners.empty()) {
+                return true;
+            }
+            usleep(pollIntervalMs * 1000);
+        }
+
+        return !listeners.empty();
+    }
+
+    /**
+     * Put the persisted CEC-enabled setting back to the value this test inherited.
+     *
+     * Restores in either direction, because a test may legitimately have to switch CEC off (that
+     * is how the implementation is made to clear its device cache) as well as on.
+     */
+    void RestoreCecEnabledState()
+    {
+        if (!m_cecEntryStateCaptured) {
+            return;
+        }
+
+        JsonObject params, result;
+        params["enabled"] = m_cecEnabledOnEntry;
+        InvokeServiceMethod("org.rdk.HdmiCecSource.1", "setEnabled", params, result);
+        m_cecEntryStateCaptured = false;
+    }
+
+    void TearDown() override
+    {
+        RestoreCecEnabledState();
+    }
+
     Core::ProxyType<RPC::InvokeServerType<1, 0, 4>> HdmiCecSource_Engine;
     Core::ProxyType<RPC::CommunicatorClient> HdmiCecSource_Client;
 
@@ -273,6 +400,8 @@ private:
     std::mutex m_mutex;
     std::condition_variable m_condition_variable;
     uint32_t m_event_signalled = HDMICECSOURCE_STATUS_INVALID;
+    bool m_cecEnabledOnEntry = false;
+    bool m_cecEntryStateCaptured = false;
 };
 
 HdmiCecSource_L2Test::HdmiCecSource_L2Test()
@@ -551,6 +680,23 @@ uint32_t HdmiCecSource_L2Test::CreateHdmiCecSourceInterfaceObject()
 uint32_t HdmiCecSource_L2Test::WaitForRequestStatus(uint32_t timeout_ms, HdmiCecSourceL2test_async_events_t expected_status)
 {
     return m_notificationHandler.WaitForEvent(timeout_ms, expected_status);
+}
+
+uint32_t HdmiCecSource_L2Test::WaitForJsonRpcEvent(uint32_t timeout_ms, HdmiCecSourceL2test_async_events_t expected_status)
+{
+    std::unique_lock<std::mutex> lock(m_mutex);
+    auto timeout = std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+    while (!(m_event_signalled & expected_status)) {
+        if (m_condition_variable.wait_until(lock, timeout) == std::cv_status::timeout) {
+            TEST_LOG("Timeout waiting for JSON-RPC event: 0x%08X", expected_status);
+            return HDMICECSOURCE_STATUS_INVALID;
+        }
+    }
+
+    uint32_t signalled = m_event_signalled & expected_status;
+    m_event_signalled = HDMICECSOURCE_STATUS_INVALID;
+    return signalled;
 }
 
 void HdmiCecSource_L2Test::onActiveSourceStatusUpdated(const JsonObject& message)
@@ -1887,38 +2033,436 @@ TEST_F(HdmiCecSource_L2Test, OnDeviceAddedEvent)
 }
 
 /**
- * @brief Test OnDeviceRemoved event
+ * @brief Test OnDeviceRemoved event, driven through the production emission path
  *
- * This test verifies that the OnDeviceRemoved event is received correctly.
+ * Drives the production removal path end to end and asserts the payload it carries.
+ *
+ * The event is only ever emitted from HdmiCecSourceImplementation::removeDevice(), and only
+ * for a logical address the plugin currently believes is present. The test therefore
+ * establishes that precondition through production code as well:
+ *
+ *   1. poll GetDeviceList() until the plugin's own discovery sweep reports at least one
+ *      present device. GetDeviceList() signals the poll thread's condition variable before
+ *      it reads the table, so this both drives and observes discovery;
+ *   2. snapshot the addresses it reports - removeDevice() emits only for a device flagged
+ *      present, so that snapshot is exactly the set the removal sweep owes us;
+ *   3. disable CEC. CECDisable() calls removeAllCecDevices(), which walks addresses 0..14
+ *      and emits one OnDeviceRemoved per present device, synchronously on the SetEnabled
+ *      call, so the payload is complete by the time SetEnabled() returns.
+ *
+ * Synchronisation is deliberately confined to public APIs and bounded waits. The poll thread
+ * is running for the whole test, and gmock's expectation state is not safe to mutate while
+ * another thread is calling the mock, so the test never reconfigures p_connectionMock and
+ * never injects frames while that thread is live - doing either crashes the plugin host.
+ *
+ * Nothing here calls the notification handler directly: if production stopped emitting the
+ * event, or emitted it for the wrong address, the test fails. Interface acquisition is a
+ * fatal assertion rather than a log line, and cleanup runs on every exit path.
  */
 TEST_F(HdmiCecSource_L2Test, OnDeviceRemovedEvent)
 {
-    if (CreateHdmiCecSourceInterfaceObject() != Core::ERROR_NONE) {
-        TEST_LOG("Invalid HdmiCecSource_Client");
-    } else {
-        EXPECT_TRUE(m_controller_cecSource != nullptr);
-        if (m_controller_cecSource) {
-            EXPECT_TRUE(m_cecSourcePlugin != nullptr);
-            if (m_cecSourcePlugin) {
-                // Simulate device removed event
-                int testLogicalAddress = 4;
-                m_notificationHandler.OnDeviceRemoved(testLogicalAddress);
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSourceInterfaceObject())
+        << "the COM-RPC interface is a precondition of this test, not an optional extra";
+    ASSERT_NE(nullptr, m_controller_cecSource);
+    ASSERT_NE(nullptr, m_cecSourcePlugin);
 
-                uint32_t status = WaitForRequestStatus(EVNT_TIMEOUT, ON_DEVICE_REMOVED);
-                EXPECT_EQ(status, ON_DEVICE_REMOVED);
-                EXPECT_EQ(m_notificationHandler.GetLogicalAddress(), testLogicalAddress);
-                TEST_LOG("OnDeviceRemoved event verified");
+    // The addresses production currently believes are present, read through the public API.
+    // GetDeviceList() signals the poll thread's condition variable before it reads the table,
+    // so calling it both drives discovery and observes it.
+    auto presentLogicalAddresses = [this]() {
+        std::vector<int> addresses;
+        uint32_t numberOfDevices = 0;
+        IHdmiCecSourceDeviceListIterator* deviceList = nullptr;
+        bool listSuccess = false;
 
-                m_cecSourcePlugin->Unregister(&m_notificationHandler);
-                m_cecSourcePlugin->Release();
-            } else {
-                TEST_LOG("m_cecSourcePlugin is NULL");
+        if (m_cecSourcePlugin != nullptr
+            && m_cecSourcePlugin->GetDeviceList(numberOfDevices, deviceList, listSuccess) == Core::ERROR_NONE
+            && deviceList != nullptr) {
+            HdmiCecSourceDevice device;
+            while (deviceList->Next(device)) {
+                addresses.push_back(device.logicalAddress);
             }
-            m_controller_cecSource->Release();
-        } else {
-            TEST_LOG("m_controller_cecSource is NULL");
+            deviceList->Release();
+        }
+        return addresses;
+    };
+
+    // Bounded wait until two consecutive readings agree, i.e. the discovery sweep has stopped
+    // changing the device table. This is a hard requirement, not a convenience: addDevice()
+    // and removeDevice() fan notifications out by walking _hdmiCecSourceNotifications WITHOUT
+    // holding _adminLock, while Register()/Unregister() mutate that same list under it. So
+    // detaching a notification while a sweep is in flight erases the element the sweep is
+    // iterating and releases the proxy it is about to call, which takes the plugin host down
+    // with SIGSEGV. Quiescing first is the only test-side way to close that window.
+    std::function<std::vector<int>()> waitForDiscoveryToSettle = [&presentLogicalAddresses]() {
+        std::vector<int> previous = presentLogicalAddresses();
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::milliseconds(4 * EVNT_TIMEOUT);
+        while (std::chrono::steady_clock::now() < limit) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            std::vector<int> current = presentLogicalAddresses();
+            if (!current.empty() && current == previous) {
+                return current;
+            }
+            previous = std::move(current);
+        }
+        return previous;
+    };
+
+    // Cleanup must survive a fatal assertion in the body, so it is owned by a scope guard
+    // rather than by trailing statements. The guard holds references to the fixture's own
+    // pointers so it also clears them, leaving no dangling interface behind, and quiesces
+    // discovery before detaching for the reason documented above.
+    struct InterfaceGuard {
+        std::function<std::vector<int>()>& quiesce;
+        Exchange::IHdmiCecSource*& plugin;
+        PluginHost::IShell*& controller;
+        Exchange::IHdmiCecSource::INotification* notification;
+
+        ~InterfaceGuard()
+        {
+            if (plugin != nullptr) {
+                quiesce();
+                plugin->Unregister(notification);
+                plugin->Release();
+                plugin = nullptr;
+            }
+            if (controller != nullptr) {
+                controller->Release();
+                controller = nullptr;
+            }
+        }
+    } interfaceGuard { waitForDiscoveryToSettle, m_cecSourcePlugin, m_controller_cecSource, &m_notificationHandler };
+
+    // Step 1 and 2: wait, boundedly, for production's own discovery sweep to settle, and keep
+    // the addresses it reports.
+    const std::vector<int> presentAddresses = waitForDiscoveryToSettle();
+
+    ASSERT_FALSE(presentAddresses.empty())
+        << "discovery reported no present device, so there is nothing for a removal to report";
+    TEST_LOG("discovery reported %zu present device(s); first is logical address %d",
+             presentAddresses.size(), presentAddresses.front());
+
+    m_notificationHandler.ResetEvent();
+    m_notificationHandler.ClearRemovedLogicalAddresses();
+
+    // Step 3: CECDisable() clears the cache, which is the production removal path.
+    HdmiCecSourceSuccess disableResult;
+    ASSERT_EQ(Core::ERROR_NONE, m_cecSourcePlugin->SetEnabled(false, disableResult));
+    EXPECT_TRUE(disableResult.success);
+
+    EXPECT_EQ(ON_DEVICE_REMOVED, WaitForRequestStatus(EVNT_TIMEOUT, ON_DEVICE_REMOVED))
+        << "CECDisable() did not emit OnDeviceRemoved";
+
+    // The payload has to name the devices that were actually present: every address in the
+    // snapshot must have been reported, and every reported address must be a valid CEC
+    // logical address. Discovery may have added more devices between the snapshot and the
+    // disable, so the reported set is allowed to be larger - never smaller.
+    const std::vector<int> removedAddresses = m_notificationHandler.GetRemovedLogicalAddresses();
+    ASSERT_FALSE(removedAddresses.empty()) << "no OnDeviceRemoved payload was recorded";
+    for (int address : removedAddresses) {
+        EXPECT_GE(address, 0);
+        EXPECT_LT(address, static_cast<int>(LogicalAddress::UNREGISTERED));
+    }
+    for (int expected : presentAddresses) {
+        EXPECT_NE(removedAddresses.end(),
+                  std::find(removedAddresses.begin(), removedAddresses.end(), expected))
+            << "no OnDeviceRemoved was emitted for present logical address " << expected;
+    }
+    TEST_LOG("OnDeviceRemoved verified for %zu logical address(es)", removedAddresses.size());
+
+    // Leave CEC enabled, which is how every other test in this suite finds it - setEnabled
+    // persists, so skipping this would poison the rest of the suite. The scope guard then
+    // waits for the sweep this re-enable starts to settle before it detaches the notification.
+    HdmiCecSourceSuccess enableResult;
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSourcePlugin->SetEnabled(true, enableResult));
+    EXPECT_TRUE(enableResult.success);
+}
+
+/**
+ * @brief Test OnDeviceRemoved event for a device announced over the frame path
+ *
+ * This test verifies that the implementation raises OnDeviceRemoved to a COM-RPC registered
+ * client when a CEC device it had announced goes away.
+ *
+ * It used to call m_notificationHandler.OnDeviceRemoved(4) directly. That asserted nothing about
+ * the plugin: the test was invoking its own handler, so the event flag and the logical address it
+ * then checked were values the test itself had just written, and the assertions would have held
+ * with the implementation removed entirely. The production path is driven instead, end to end:
+ *
+ *   1. announce a peer at logical address 4 with an <Active Source> frame through the registered
+ *      FrameListener - HdmiCecSourceProcessor::process(ActiveSource) calls addDevice(header.from),
+ *      which fans OnDeviceAdded out over _hdmiCecSourceNotifications;
+ *   2. confirm the implementation really did register it (otherwise there is nothing to remove and
+ *      the removal assertion would be meaningless);
+ *   3. disable CEC over COM-RPC - CECDisable tears the connection down and calls
+ *      removeAllCecDevices(), which calls removeDevice() for every present address and fans
+ *      OnDeviceRemoved out over the same notification list;
+ *   4. observe that notification arriving at the registered handler, carrying address 4.
+ *
+ * The inherited CEC-enabled setting is restored by the fixture's TearDown, since step 3 changes
+ * process-global persisted state that later tests would otherwise inherit.
+ */
+TEST_F(HdmiCecSource_L2Test, OnDeviceRemovedEventForAnnouncedDevice)
+{
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSourceInterfaceObject());
+    ASSERT_NE(nullptr, m_controller_cecSource);
+    ASSERT_NE(nullptr, m_cecSourcePlugin);
+
+    const int testLogicalAddress = 4;
+
+    // CEC on, and the implementation's own FrameListener in place - without it there is no inbound
+    // path at all and this test could only ever pass vacuously.
+    ASSERT_TRUE(EnableCecAndAwaitFrameListener()) << "CEC could not be enabled, so no FrameListener was captured.";
+
+    // <Active Source> from logical address 4, broadcast, physical address 2.0.0.0.
+    uint8_t activeSourceFrame[] = { 0x4F, 0x82, 0x20, 0x00 };
+    CECFrame frame(activeSourceFrame, sizeof(activeSourceFrame));
+
+    TEST_LOG("Announcing logical address %d through the production frame path", testLogicalAddress);
+    for (auto* listener : listeners) {
+        if (listener) {
+            listener->notify(frame);
         }
     }
+
+    // Confirm through the plugin's own API that the implementation is holding the device, which is
+    // the precondition for observing its removal. OnDeviceAdded is deliberately NOT used as that
+    // proof: addDevice only notifies when the address was not already marked present, and the
+    // implementation's poll thread discovers peers during activation, so the announcement above is
+    // frequently a no-op notification-wise while still being the correct production entry point.
+    JsonObject params, deviceListBefore;
+    ASSERT_EQ(Core::ERROR_NONE, InvokeServiceMethod("org.rdk.HdmiCecSource.1", "getDeviceList", params, deviceListBefore));
+    ASSERT_TRUE(deviceListBefore.HasLabel("deviceList"));
+    bool devicePresentBefore = false;
+    JsonArray reportedDevices = deviceListBefore["deviceList"].Array();
+    for (int index = 0; index < reportedDevices.Length(); ++index) {
+        if (reportedDevices[index].Object()["logicalAddress"].Number() == testLogicalAddress) {
+            devicePresentBefore = true;
+        }
+    }
+    ASSERT_TRUE(devicePresentBefore) << "the implementation is not holding logical address "
+                                     << testLogicalAddress << ", so its removal cannot be observed";
+
+    // Disabling CEC is the production route to device removal: CECDisable calls
+    // removeAllCecDevices(), which calls removeDevice() for every present address and notifies
+    // each one over the registered notification list.
+    HdmiCecSourceSuccess disableResult;
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSourcePlugin->SetEnabled(false, disableResult));
+    EXPECT_TRUE(disableResult.success);
+
+    const uint32_t status = WaitForRequestStatus(EVNT_TIMEOUT, ON_DEVICE_REMOVED);
+    EXPECT_TRUE(status & ON_DEVICE_REMOVED);
+    // The sweep reports several addresses, so name the one under test rather than trusting
+    // whichever notification happened to arrive last.
+    EXPECT_TRUE(m_notificationHandler.WasRemoved(testLogicalAddress))
+        << "OnDeviceRemoved was never raised for logical address " << testLogicalAddress;
+
+    // ...and the removal is real, not just announced: the plugin no longer reports the device.
+    JsonObject deviceListAfter;
+    params.Clear();
+    EXPECT_EQ(Core::ERROR_NONE, InvokeServiceMethod("org.rdk.HdmiCecSource.1", "getDeviceList", params, deviceListAfter));
+    if (deviceListAfter.HasLabel("deviceList")) {
+        JsonArray remainingDevices = deviceListAfter["deviceList"].Array();
+        bool devicePresentAfter = false;
+        for (int index = 0; index < remainingDevices.Length(); ++index) {
+            if (remainingDevices[index].Object()["logicalAddress"].Number() == testLogicalAddress) {
+                devicePresentAfter = true;
+            }
+        }
+        EXPECT_FALSE(devicePresentAfter) << "logical address " << testLogicalAddress
+                                        << " is still in the device list after removal";
+    }
+    TEST_LOG("OnDeviceRemoved event verified through the production removal path");
+
+    m_cecSourcePlugin->Unregister(&m_notificationHandler);
+    m_cecSourcePlugin->Release();
+    m_controller_cecSource->Release();
+}
+
+/**
+ * @brief Test OnDeviceRemoved event, driven through the production emission path
+ *
+ * The event is NOT injected into the test's own handler. It is produced by
+ * HdmiCecSourceImplementation itself, which is the only thing that makes the test capable of
+ * failing when production regresses:
+ *
+ *   Connection::ping() raises CECNoAckException for one peer
+ *     -> HdmiCecSourceImplementation::pingDeviceUpdateList() catches it (Implementation.cpp:1387)
+ *     -> removeDevice(idev)                                    (Implementation.cpp:1391 / :525)
+ *     -> (*index)->OnDeviceRemoved(logicalAddress) fan-out over _hdmiCecSourceNotifications
+ *                                                              (Implementation.cpp:539-543)
+ *     -> the COM-RPC sink this test registered, AND
+ *     -> HdmiCecSource::Notification::OnDeviceRemoved            (HdmiCecSource.h:98-102)
+ *          -> Exchange::JHdmiCecSource::Event::OnDeviceRemoved -> Notify("onDeviceRemoved")
+ *
+ * Both legs are asserted: the COM-RPC leg carries the logical address, so it pins down *which*
+ * peer production code decided had gone away; the JSON-RPC subscription proves the plugin's own
+ * notification sink ran and published the event outward.
+ *
+ * Determinism. The polling thread that ActivateService() started has, by the time the body runs,
+ * already ACKed and added every peer (Connection::ping() is left at the NiceMock default, which
+ * returns without throwing, and the fixture asserts below that the device list is non-empty). No
+ * further OnDeviceAdded can therefore fire, and OnDeviceInfoUpdated only fires from
+ * sendDeviceUpdateInfo(), which needs an inbound frame this test never injects. So after the
+ * per-test ping() policy is installed, the one and only notification the implementation can raise
+ * is OnDeviceRemoved for the single address that policy takes off the bus - which is why reading
+ * the recorded logical address afterwards is safe rather than racy.
+ *
+ * The poll thread is woken through a real API rather than a sleep: GetDeviceList() signals
+ * m_condSig (Implementation.cpp:1336-1338), which is exactly what the thread waits on between
+ * sweeps. The kick is retried a bounded number of times because pthread_cond_signal is lost if it
+ * lands while the thread happens to be mid-sweep.
+ */
+TEST_F(HdmiCecSource_L2Test, OnDeviceRemovedEventOnPingFailure)
+{
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSourceInterfaceObject());
+    ASSERT_NE(nullptr, m_controller_cecSource);
+    ASSERT_NE(nullptr, m_cecSourcePlugin);
+
+    JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSOURCE_CALLSIGN, HDMICECSOURCE_L2TEST_CALLSIGN);
+    EXPECT_EQ(Core::ERROR_NONE,
+        jsonrpc.Subscribe<JsonObject>(EVNT_TIMEOUT,
+            _T("onDeviceRemoved"),
+            &HdmiCecSource_L2Test::onDeviceRemoved,
+            this));
+
+    /* Ask production code which peers it currently believes are on the bus. */
+    uint32_t devicesBefore = 0;
+    IHdmiCecSourceDeviceListIterator* deviceList = nullptr;
+    bool listSuccess = false;
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSourcePlugin->GetDeviceList(devicesBefore, deviceList, listSuccess));
+    EXPECT_TRUE(listSuccess);
+
+    std::vector<int> presentAddresses;
+    if (deviceList != nullptr) {
+        HdmiCecSourceDevice device;
+        while (deviceList->Next(device)) {
+            presentAddresses.push_back(device.logicalAddress);
+        }
+        deviceList->Release();
+    }
+    /* Precondition asserted, not assumed: there has to be something to remove. */
+    ASSERT_FALSE(presentAddresses.empty());
+
+    /* Remove a peer other than the TV, so nothing in the active-source bookkeeping is disturbed. */
+    int target = -1;
+    for (int address : presentAddresses) {
+        if (address != LogicalAddress::TV) {
+            target = address;
+            break;
+        }
+    }
+    ASSERT_NE(-1, target);
+    TEST_LOG("Taking logical address %d off the bus", target);
+
+    ON_CALL(*p_connectionMock, ping(::testing::_, ::testing::_, ::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [target](const LogicalAddress&, const LogicalAddress& to, const Throw_e&) {
+                if (to.toInt() == target) {
+                    throw CECNoAckException();
+                }
+            }));
+
+    /* Discard everything the activation sweep signalled, so what is waited on below is new. */
+    m_notificationHandler.ResetEvent();
+
+    uint32_t signalled = HDMICECSOURCE_STATUS_INVALID;
+    for (int attempt = 0; (attempt < 5) && !(signalled & ON_DEVICE_REMOVED); ++attempt) {
+        uint32_t devicesNow = 0;
+        IHdmiCecSourceDeviceListIterator* kickList = nullptr;
+        bool kickSuccess = false;
+        EXPECT_EQ(Core::ERROR_NONE, m_cecSourcePlugin->GetDeviceList(devicesNow, kickList, kickSuccess));
+        if (kickList != nullptr) {
+            kickList->Release();
+        }
+        signalled = WaitForRequestStatus(EVNT_TIMEOUT / 5, ON_DEVICE_REMOVED);
+    }
+
+    EXPECT_TRUE(signalled & ON_DEVICE_REMOVED);
+    EXPECT_EQ(m_notificationHandler.GetLogicalAddress(), target);
+
+    /* The JSON-RPC leg: proves HdmiCecSource::Notification::OnDeviceRemoved published the event. */
+    EXPECT_TRUE(WaitForJsonRpcEvent(EVNT_TIMEOUT, ON_DEVICE_REMOVED) & ON_DEVICE_REMOVED);
+
+    /* Independent post-condition: the peer is gone from the implementation's own device list. */
+    uint32_t devicesAfter = 0;
+    IHdmiCecSourceDeviceListIterator* afterList = nullptr;
+    bool afterSuccess = false;
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSourcePlugin->GetDeviceList(devicesAfter, afterList, afterSuccess));
+    bool targetStillPresent = false;
+    if (afterList != nullptr) {
+        HdmiCecSourceDevice device;
+        while (afterList->Next(device)) {
+            if (device.logicalAddress == target) {
+                targetStillPresent = true;
+            }
+        }
+        afterList->Release();
+    }
+    EXPECT_FALSE(targetStillPresent);
+    EXPECT_LT(devicesAfter, devicesBefore);
+    TEST_LOG("OnDeviceRemoved verified for logical address %d (%u devices before, %u after)",
+        target, devicesBefore, devicesAfter);
+
+    jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("onDeviceRemoved"));
+    m_cecSourcePlugin->Unregister(&m_notificationHandler);
+    m_cecSourcePlugin->Release();
+    m_controller_cecSource->Release();
+}
+
+/**
+ * @brief Negative counterpart: no ACK loss, no OnDeviceRemoved
+ *
+ * The corner case Directive 2 asks for on the same API, and at the same time the control that
+ * makes OnDeviceRemovedEventOnPingFailure above trustworthy. Everything is identical except that the per-test
+ * ping() policy is omitted, so every peer keeps ACKing and pingDeviceUpdateList() has no reason to
+ * call removeDevice(). The same poll-thread kick and the same wait helper are used, and the wait
+ * is required to time out - which is only possible if the positive test's PASS was caused by
+ * production code reacting to the missing ACK rather than by the harness signalling itself.
+ */
+TEST_F(HdmiCecSource_L2Test, OnDeviceRemovedEvent_PeersStillAcking_ProducesNoNotification)
+{
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSourceInterfaceObject());
+    ASSERT_NE(nullptr, m_cecSourcePlugin);
+
+    uint32_t devicesBefore = 0;
+    IHdmiCecSourceDeviceListIterator* deviceList = nullptr;
+    bool listSuccess = false;
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSourcePlugin->GetDeviceList(devicesBefore, deviceList, listSuccess));
+    EXPECT_TRUE(listSuccess);
+    if (deviceList != nullptr) {
+        deviceList->Release();
+    }
+    ASSERT_GT(devicesBefore, 0u);
+
+    m_notificationHandler.ResetEvent();
+
+    /* Drive several poll sweeps with ping() left ACKing for every address. */
+    for (int kick = 0; kick < 3; ++kick) {
+        uint32_t devicesNow = 0;
+        IHdmiCecSourceDeviceListIterator* kickList = nullptr;
+        bool kickSuccess = false;
+        EXPECT_EQ(Core::ERROR_NONE, m_cecSourcePlugin->GetDeviceList(devicesNow, kickList, kickSuccess));
+        if (kickList != nullptr) {
+            kickList->Release();
+        }
+    }
+
+    EXPECT_EQ(HDMICECSOURCE_STATUS_INVALID, WaitForRequestStatus(1500, ON_DEVICE_REMOVED));
+
+    uint32_t devicesAfter = 0;
+    IHdmiCecSourceDeviceListIterator* afterList = nullptr;
+    bool afterSuccess = false;
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSourcePlugin->GetDeviceList(devicesAfter, afterList, afterSuccess));
+    if (afterList != nullptr) {
+        afterList->Release();
+    }
+    EXPECT_EQ(devicesAfter, devicesBefore);
+    TEST_LOG("No OnDeviceRemoved raised while every peer keeps ACKing (%u devices throughout)", devicesAfter);
+
+    m_cecSourcePlugin->Unregister(&m_notificationHandler);
+    m_cecSourcePlugin->Release();
+    m_controller_cecSource->Release();
 }
 
 //======================================== Frame Injection Tests ========================================
