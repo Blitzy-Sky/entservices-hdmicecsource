@@ -100,10 +100,15 @@
 #       CMakeLists.txt, the workflows, /etc/lcovrc, entservices-testframework, or anything
 #       under plugin/.  It is not side-effect free, and its three side effects are stated
 #       here rather than buried:
-#         (a) $HOME/.lcovrc -- CI plants a branch-disabled copy there, so the file is
-#             stashed into a private mktemp directory, removed for the run, and restored by
-#             an EXIT/INT/TERM/HUP trap however the run ends.  Nothing is destroyed and the
-#             stash path is logged.  For a run that does not touch $HOME at all:
+#         (a) $HOME/.lcovrc -- CI plants a branch-disabled copy there, so whatever is at
+#             that path is MOVED ASIDE into a private mktemp directory for the run and moved
+#             back by an EXIT/INT/TERM/HUP trap however the run ends.  Nothing is deleted,
+#             nothing is copied, and the entry returns with its original type intact -- a
+#             symlink comes back a symlink, a directory comes back a directory -- because
+#             `mv` relocates the directory entry rather than recreating content.  The stash
+#             path is logged, so even SIGKILL leaves a named recoverable copy.  An unset HOME
+#             is not an error: there is simply nothing to move.  For a run that does not
+#             touch $HOME at all:
 #                 HOME="$(mktemp -d)" ./run_coverage.sh l1
 #         (b) the level's *.gcda counters are zeroed before the suite runs, so the figures
 #             describe THIS run and cannot silently accumulate an earlier one.
@@ -227,21 +232,34 @@ readonly GENHTML_TITLE="$REPO_NAME coverage"
 # script was exercised with, and documented elsewhere in this workspace as hard-failing), so
 # the lists below stay on classes that are known-good here.  Add nothing speculatively: a
 # rejected class turns a coverage run into a usage error.
-readonly LCOV_CAPTURE_IGNORE="mismatch,gcov,unused,empty,negative,source,graph,inconsistent,corrupt"
+#
+# `deprecated` is the one class this script adds to the recipe's nine, and it is added for a
+# named reason rather than as a blanket.  This repository's own Tests/L1Tests/.lcovrc_l1 uses
+# the backward-compatible key spellings (lcov_branch_coverage, lcov_function_coverage) so that
+# a pre-2.x lcov can still read it, and passing that file with --config-file -- which is what
+# makes the repository's settings take effect at all -- is itself what makes lcov 2.x announce
+# those keys as deprecated, four times per invocation.  Editing the config file's key
+# spellings is a separate decision and is not made here, so the warnings are demoted instead.
+# The token is DOUBLED because that is lcov's own spelling for "counted, not printed": listed
+# once the message still prints, listed twice it is counted into the message summary lcov emits
+# at the end of the step.  Nothing is hidden -- the counts remain in that summary and in the
+# per-step logs -- and the deprecation is a property of the configuration file, never of the
+# coverage data.  The sibling middleware runner spells this identically.
+readonly LCOV_CAPTURE_IGNORE="mismatch,gcov,unused,empty,negative,source,graph,inconsistent,corrupt,deprecated,deprecated"
 # Narrower lists downstream, so that error classes which cannot legitimately arise in a step
 # are not blanket-suppressed there.  `unused` is required for the filter step because an
 # exclusion glob that matches nothing is an ERROR in lcov 2.x (exit 25) and the glob lists are
 # reproduced verbatim rather than pruned to whatever this tree happens to contain.
-readonly LCOV_FILTER_IGNORE="unused,empty,inconsistent"
+readonly LCOV_FILTER_IGNORE="unused,empty,inconsistent,deprecated,deprecated"
 # `inconsistent` is required for the summary and gate steps: this tree yields "line is hit but
 # no branches on line have been evaluated" records, and without the ignore lcov escalates them
 # to a `corrupt` read failure and exits non-zero -- which would make the gate fail for a reason
 # that has nothing to do with coverage, i.e. would make the gate lie.  `corrupt` itself is NOT
 # ignored, so a genuinely truncated trace still stops the run.
-readonly LCOV_SUMMARY_IGNORE="empty,inconsistent"
+readonly LCOV_SUMMARY_IGNORE="empty,inconsistent,deprecated,deprecated"
 # genhtml additionally needs `source`, because the trace records absolute paths from the build
 # host and a source file that cannot be re-read is otherwise fatal to the report.
-readonly GENHTML_IGNORE="empty,inconsistent,source"
+readonly GENHTML_IGNORE="empty,inconsistent,source,deprecated,deprecated"
 
 # Filled by resolve_lcov_config() with `--config-file <this level's .lcovrc>` when the
 # repository ships one, so that the settings in effect are the ones this repository versions
@@ -350,45 +368,100 @@ rule() { printf '%s\n' '--------------------------------------------------------
 # suppresses exactly the branch data this script exists to collect, so it has to go before
 # any lcov invocation -- not for tidiness, but because the measurement is wrong otherwise.
 #
-# The removal is done without destroying anything: the file is copied into a private
-# mode-0700 mktemp directory first, then removed, and restored by the cleanup trap however
-# the run ends -- normal exit, gate failure, or Ctrl-C.  The stash path is logged so the
-# copy is never a mystery.
+# It is MOVED ASIDE, never copied-then-deleted, and never deleted outright.  `mv` relocates
+# the directory ENTRY, so whatever is at that path comes back exactly as it was: a symlink
+# returns as the same symlink rather than as a regular copy of its target, a directory
+# returns as that directory, and permissions, ownership and timestamps are untouched because
+# nothing is ever re-created from content.  A copy-based scheme cannot promise any of that --
+# it silently converted a symlinked ~/.lcovrc into a regular file and failed outright on a
+# directory -- which is why this is `mv` in both directions.
+#
+# The stash is a private mode-0700 mktemp directory, the stash variable is set BEFORE the
+# move so an interrupt between the two still restores, the path is logged so even a SIGKILL
+# (the one signal no trap can service) leaves a named recoverable copy, and the restore runs
+# from the cleanup trap however the run ends -- normal exit, gate failure, or Ctrl-C.
+#
+# HOME may legitimately be unset -- `env -i` invocations, systemd units, and containers with
+# no passwd entry all reach here that way -- so it is read through ${HOME:-} and an unset
+# value means "there is no home configuration to move aside", not a fatal error.  Nothing
+# below ever spells the path with `~`, which would expand from the passwd database and so
+# could act on a directory the caller never mentioned.
 # ------------------------------------------------------------------------------------
 LCOVRC_STASH_DIR=''
 LCOVRC_STASHED=0
 
 restore_home_lcovrc() {
     [ "$LCOVRC_STASHED" -eq 1 ] || return 0
-    if [ -f "$LCOVRC_STASH_DIR/lcovrc" ]; then
-        if cp -p -- "$LCOVRC_STASH_DIR/lcovrc" "$HOME/.lcovrc" 2>/dev/null; then
+    local stash="$LCOVRC_STASH_DIR/lcovrc"
+    # -e is false for a dangling symlink, so -L is tested too: the entry is put back
+    # whatever its type, which is the whole point of moving rather than copying.
+    if [ -e "$stash" ] || [ -L "$stash" ]; then
+        if [ -n "${HOME:-}" ] && mv -f -- "$stash" "$HOME/.lcovrc" 2>/dev/null; then
             log "restored your original $HOME/.lcovrc"
         else
-            warn "could not restore $HOME/.lcovrc; your copy is preserved at $LCOVRC_STASH_DIR/lcovrc"
+            warn "could not restore ${HOME:-\$HOME}/.lcovrc; your original is intact at $stash"
+            warn "    put it back with:  mv '$stash' '${HOME:-\$HOME}/.lcovrc'"
             return 0
         fi
     fi
-    rm -f -- "$LCOVRC_STASH_DIR/lcovrc" 2>/dev/null || true
     rmdir -- "$LCOVRC_STASH_DIR" 2>/dev/null || true
     LCOVRC_STASHED=0
 }
 
-# `rm -f ~/.lcovrc` FIRST, before any lcov invocation -- with the original preserved.
+# Move $HOME/.lcovrc aside FIRST, before any lcov invocation -- with the original intact.
 neutralise_home_lcovrc() {
     [ "$LCOVRC_STASHED" -eq 0 ] || return 0
-    if [ -e "$HOME/.lcovrc" ]; then
-        [ -n "$MKTEMP_BIN" ] || die "mktemp is required to preserve your $HOME/.lcovrc safely."
-        LCOVRC_STASH_DIR="$("$MKTEMP_BIN" -d "${TMPDIR:-/tmp}/run_coverage_lcovrc.XXXXXX")"
-        chmod 0700 -- "$LCOVRC_STASH_DIR"
-        cp -p -- "$HOME/.lcovrc" "$LCOVRC_STASH_DIR/lcovrc"
-        LCOVRC_STASHED=1
-        rm -f ~/.lcovrc
-        log "removed $HOME/.lcovrc for this run (CI plants a branch-disabled copy there);"
-        log "    your original is stashed at $LCOVRC_STASH_DIR/lcovrc and is restored on exit"
-    else
-        rm -f ~/.lcovrc
-        log "no $HOME/.lcovrc present, so nothing there can suppress branch data"
+    if [ -z "${HOME:-}" ]; then
+        log "HOME is unset, so there is no home lcov configuration to move aside"
+        return 0
     fi
+    local rc_path="$HOME/.lcovrc"
+    if [ ! -e "$rc_path" ] && [ ! -L "$rc_path" ]; then
+        log "no $rc_path present, so nothing there can suppress branch data"
+        return 0
+    fi
+    [ -n "$MKTEMP_BIN" ] || die "mktemp is required to move your $rc_path aside safely."
+    LCOVRC_STASH_DIR="$("$MKTEMP_BIN" -d "${TMPDIR:-/tmp}/run_coverage_lcovrc.XXXXXX")" \
+        || die "could not create a temporary directory to park $rc_path.  Refusing to run
+       lcov with an unknown home configuration in effect, and refusing to delete your file
+       to get around it."
+    chmod 0700 -- "$LCOVRC_STASH_DIR" 2>/dev/null || true
+    # Set the marker BEFORE the move: if the move is interrupted, or fails and this run
+    # dies, the trap still knows where to look instead of leaving the stash behind.
+    LCOVRC_STASHED=1
+    if [ ! -f "$rc_path" ] || [ -L "$rc_path" ]; then
+        local rc_kind='special file'
+        if [ -L "$rc_path" ]; then
+            rc_kind='symbolic link'
+        elif [ -d "$rc_path" ]; then
+            rc_kind='directory'
+        fi
+        log "note: $rc_path is a $rc_kind, not a regular file;"
+        log "    it is moved aside as-is and moved back unchanged -- nothing is copied or recreated"
+    fi
+    local mv_err
+    if ! mv_err="$(mv -f -- "$rc_path" "$LCOVRC_STASH_DIR/lcovrc" 2>&1)"; then
+        # Distinguish "it is gone" from "it will not move".  A sibling runner sharing this
+        # $HOME -- the sink and middleware runners are routinely run against the same one --
+        # can move the file aside between the existence check above and this move, and the
+        # owner can remove it in the same window.  The requirement here is only that NO home
+        # configuration is in effect while lcov runs, and in that case none is: continue, and
+        # leave the other run's stash to the other run rather than fighting over it.  Only a
+        # file that is still there and still will not move is a genuine failure.
+        if [ ! -e "$rc_path" ] && [ ! -L "$rc_path" ]; then
+            LCOVRC_STASHED=0
+            rmdir -- "$LCOVRC_STASH_DIR" 2>/dev/null || true
+            LCOVRC_STASH_DIR=''
+            log "$rc_path disappeared while being moved aside (a concurrent run moved it, or it"
+            log "    was removed); no home configuration is in effect, which is all this needs"
+            return 0
+        fi
+        die "could not move $rc_path aside: ${mv_err:-mv failed}
+       Fix the permissions on \$HOME and retry; this script will not delete the file instead,
+       and it will not measure with an unknown home configuration in effect."
+    fi
+    log "moved $rc_path aside for this run (CI plants a branch-disabled copy there);"
+    log "    your original is at $LCOVRC_STASH_DIR/lcovrc and is moved back on exit"
 }
 
 on_exit() {
@@ -447,7 +520,11 @@ Environment variables (all optional; shown with their defaults):
                                  \$ARTIFACT_ROOT/$REPO_NAME/<level>/.  Disposable build
                                  output -- never commit it.  Currently: $ARTIFACT_ROOT
   COVERAGE_MIN=80                Line-coverage bar, applied to the level aggregate AND to
-                                 each target.  Currently: $COVERAGE_MIN
+                                 each target.  Spelled as digits or digits.digits (80, 0,
+                                 100, 80.5) and between 0 and 100; anything else is refused
+                                 rather than coerced, because a coerced bar would yield a
+                                 gate verdict for a percentage nobody asked for.
+                                 Currently: $COVERAGE_MIN
   RUN_VALGRIND=0                 Set to 1/true/yes/on to run the suite under valgrind
                                  memcheck with the options CI uses.  Never a gate.
                                  Currently: $RUN_VALGRIND
@@ -551,6 +628,25 @@ valgrind_enabled() {
 # the figures.  Coverage numbers are compiler- and lcov-sensitive at the margin, so a run
 # that does not say which toolchain produced it is not reproducible evidence.
 # ------------------------------------------------------------------------------------
+# The artifact tree is disposable build output, and the default -- $WS/coverage-artifacts,
+# which mirrors CI writing into $GITHUB_WORKSPACE -- lands INSIDE the checkout, where neither
+# this repository's .gitignore nor the superproject's covers it.  A default-path run therefore
+# leaves untracked directories visible in `git status`, and `git add -A` would happily stage
+# them.  Editing a .gitignore is out of scope for this change, so the condition is reported
+# instead of silently accepted: say it once, per run, with the way out.
+warn_artifact_root_in_tree() {
+    case "$ARTIFACT_ROOT" in
+        "$REPO_ROOT"|"$REPO_ROOT"/*|"$WS"|"$WS"/*)
+            warn "the artifact root is inside the working tree ($ARTIFACT_ROOT)."
+            warn "    coverage_<level>.info, filtered_coverage_<level>.info and coverage_<level>/ are"
+            warn "    NOT covered by any .gitignore here, so they WILL show up in git status.  They are"
+            warn "    build output: do not commit them.  Point ARTIFACT_ROOT outside the checkout to"
+            warn "    keep the tree clean, e.g. ARTIFACT_ROOT=\"\${TMPDIR:-/tmp}/$REPO_NAME-coverage\"."
+            ;;
+        *)  ;;   # outside the checkout: the intended case, nothing to say
+    esac
+}
+
 print_configuration() {
     local levels="$1"
     rule
@@ -563,6 +659,7 @@ print_configuration() {
     log "  install (L1/L2)   : $L1_INSTALL_DIR"
     log "                      $L2_INSTALL_DIR"
     log "  artifact root     : $ARTIFACT_ROOT/$REPO_NAME/<level>/  (disposable; never commit)"
+    warn_artifact_root_in_tree
     log "  line-coverage bar : ${COVERAGE_MIN}%  (aggregate and per target)"
     log "  branch coverage   : collected and reported, NOT gated"
     log "  valgrind          : $(valgrind_enabled && echo 'enabled (never a gate)' || echo 'disabled')"
@@ -645,8 +742,20 @@ preflight() {
         esac
     done
 
+    # The bar is validated by SHAPE before it is validated by RANGE, because the range check
+    # is arithmetic and arithmetic is forgiving in exactly the wrong way: awk reads '1.2.3' as
+    # 1.2 and would then report "applying the >= 1.2.3% gate" followed by "GATE PASSED" and
+    # exit 0 -- a pass verdict derived from a threshold nobody wrote.  A malformed bar must
+    # never produce a verdict at all, so the accepted spelling is stated exactly: digits, or
+    # digits '.' digits.  That rejects multiple decimal points ('1.2.3'), a bare or leading
+    # dot ('.', '.5'), a trailing dot ('80.'), signs ('-1'), exponents ('1e2'), embedded
+    # whitespace (' 80') and anything else non-numeric, while still accepting the integer form
+    # the sibling runners require and the fractional bars this one has always allowed ('80.5').
     case "$COVERAGE_MIN" in
-        ''|*[!0-9.]*) die "COVERAGE_MIN must be a number (got '$COVERAGE_MIN')." ;;
+        ''|*[!0-9.]*|*.*.*|.*|*.) die "COVERAGE_MIN must be a number spelled as digits or digits.digits
+       -- for example 80, 0, 100 or 80.5 -- and between 0 and 100 (got '$COVERAGE_MIN').
+       A threshold that cannot be read exactly is refused rather than rounded, because a
+       coerced bar would produce a gate verdict for a percentage nobody asked for." ;;
     esac
     awk -v v="$COVERAGE_MIN" 'BEGIN { exit !(v + 0 >= 0 && v + 0 <= 100) }' \
         || die "COVERAGE_MIN must be between 0 and 100 (got '$COVERAGE_MIN')."
@@ -1621,6 +1730,17 @@ main() {
         printf "ERROR: unknown level '%s'.  Expected l1, l2 or all.\n\n" "${1:-}" >&2
         usage >&2
         exit 2
+    fi
+
+    # A bare invocation takes the documented `all` default, which runs BOTH suites and zeroes
+    # both levels' counters.  That is the intended default and --help says so, but it is not
+    # the kind of thing to discover from the output halfway through, so it is named up front.
+    # (`all` still refuses to start unless the two levels resolve to separate trees or a
+    # rebuild hook is configured, so the default cannot silently measure one tree twice.)
+    if [ "$#" -eq 0 ]; then
+        log "no level given, so the documented default applies: '$levels' -- both suites, each"
+        log "    with its own counters zeroed first.  Run '$(basename -- "$SCRIPT_PATH") l1' or"
+        log "    '$(basename -- "$SCRIPT_PATH") l2' to measure a single level."
     fi
 
     # $HOME/.lcovrc goes FIRST, before ANY lcov invocation -- including the version echo in

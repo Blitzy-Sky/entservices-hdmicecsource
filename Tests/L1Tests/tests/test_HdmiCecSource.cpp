@@ -135,10 +135,18 @@ namespace
     // "Could not open" is also not one condition.  Absent is a normal state this fixture
     // provisions from; unreadable is a failure the caller must see, so the two are
     // separated on errno instead of being collapsed into success.
-    static bool readFile(const char* fileName, bool& filePresent, std::string& fileContents)
+    //
+    // fileMode carries the snapshot's permissions out to the caller, because contents alone
+    // are not the whole of the state being borrowed: these are host-global paths, and a
+    // suite that hands back the right bytes under wider permissions has still changed the
+    // host.  It receives the FULL st_mode - never a masked copy - so that zero
+    // unambiguously means "nothing was captured" (S_IFREG is always set on a snapshot of a
+    // regular file, so a real snapshot can never be zero, not even for a 0000-mode file).
+    static bool readFile(const char* fileName, bool& filePresent, std::string& fileContents, mode_t& fileMode)
     {
         filePresent = false;
         fileContents.clear();
+        fileMode = 0;
 
         const int fd = ::open(fileName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
         if (fd < 0) {
@@ -159,6 +167,7 @@ namespace
         }
 
         filePresent = true;
+        fileMode = fileStat.st_mode;
         char buffer[4096];
         ssize_t bytesRead = 0;
         while ((bytesRead = ::read(fd, buffer, sizeof(buffer))) > 0) {
@@ -170,17 +179,25 @@ namespace
         if (bytesRead < 0) {
             printf("File %s failed mid-read: %s\n", fileName, strerror(readErrno));
             fileContents.clear();
+            fileMode = 0;
             return false;
         }
 
         return true;
     }
 
-    static bool writeFile(const char* fileName, const std::string& fileContents)
+    // capturedMode is the st_mode a readFile() snapshot reported, and when it is non-zero it
+    // is the ONLY value that can be correct to write with.  The mode standing on the path at
+    // this moment is not the mode the host had: several test bodies in this suite delete
+    // /etc/device.properties and recreate it through an ofstream, which lands at
+    // 0666 & ~umask, so deriving the mode here would hand the host back a file whose
+    // permissions the suite itself had just widened - restoring the bytes while silently
+    // keeping the widening.  Zero means no snapshot is being restored (this call is
+    // provisioning a value for a test to read), and only then are the permissions the path
+    // already carries preserved instead.
+    static bool writeFile(const char* fileName, const std::string& fileContents, const mode_t capturedMode = 0)
     {
-        // Preserve the permissions the path already carried; these are host-global files
-        // that sibling suites and the host fixtures read after this one has finished.
-        mode_t fileMode = 0644;
+        mode_t fileMode = (capturedMode != 0) ? (capturedMode & 07777) : static_cast<mode_t>(0644);
         struct stat existingStat;
         if (lstat(fileName, &existingStat) == 0) {
             if (!S_ISREG(existingStat.st_mode)) {
@@ -188,7 +205,9 @@ namespace
                        fileName, existingStat.st_mode);
                 return false;
             }
-            fileMode = existingStat.st_mode & 07777;
+            if (capturedMode == 0) {
+                fileMode = existingStat.st_mode & 07777;
+            }
 
             // std::remove, NOT unlink: this binary is linked with -Wl,-wrap,unlink, so a
             // direct unlink() call is redirected to the Wraps mock and removes nothing -
@@ -298,10 +317,13 @@ namespace
     // Put a snapshotted file back.  wasPresent must come from a readFile() call that
     // returned true, which is what makes deleting the file safe in the absent case: readFile
     // only reports absence for a file that was genuinely not there.
-    static bool restoreFile(const char* fileName, const bool wasPresent, const std::string& fileContents)
+    //
+    // capturedMode comes from the same readFile() call, so the file goes back with the
+    // permissions it had rather than the permissions it happens to be wearing now.
+    static bool restoreFile(const char* fileName, const bool wasPresent, const std::string& fileContents, const mode_t capturedMode)
     {
         if (wasPresent) {
-            return writeFile(fileName, fileContents);
+            return writeFile(fileName, fileContents, capturedMode);
         }
 
         // The file did not exist before this fixture ran, so it has to be gone again.
@@ -360,10 +382,12 @@ namespace
         ScopedLifecycleFiles()
             : m_devicePropertiesWasPresent(false)
             , m_devicePropertiesContents()
-            , m_devicePropertiesSnapshotCaptured(readFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents))
+            , m_devicePropertiesMode(0)
+            , m_devicePropertiesSnapshotCaptured(readFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents, m_devicePropertiesMode))
             , m_cecSettingsWasPresent(false)
             , m_cecSettingsContents()
-            , m_cecSettingsSnapshotCaptured(readFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents))
+            , m_cecSettingsMode(0)
+            , m_cecSettingsSnapshotCaptured(readFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents, m_cecSettingsMode))
             , m_cecSettingsDirectoryCreated(false)
             , m_cecSettingsDirectoryPath()
             , m_devicePropertiesProvisioned(false)
@@ -391,10 +415,10 @@ namespace
             if (!m_restored) {
                 bool restored = true;
                 if (m_cecSettingsSnapshotCaptured) {
-                    restored = restoreFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents) && restored;
+                    restored = restoreFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents, m_cecSettingsMode) && restored;
                 }
                 if (m_devicePropertiesSnapshotCaptured) {
-                    restored = restoreFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents) && restored;
+                    restored = restoreFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents, m_devicePropertiesMode) && restored;
                 }
                 restored = removeCreatedDirectory(m_cecSettingsDirectoryCreated, m_cecSettingsDirectoryPath) && restored;
 
@@ -420,8 +444,8 @@ namespace
             }
 
             if (!m_restored) {
-                const bool cecSettingsRestored = restoreFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents);
-                const bool devicePropertiesRestored = restoreFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents);
+                const bool cecSettingsRestored = restoreFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents, m_cecSettingsMode);
+                const bool devicePropertiesRestored = restoreFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents, m_devicePropertiesMode);
                 const bool directoryRemoved = removeCreatedDirectory(m_cecSettingsDirectoryCreated, m_cecSettingsDirectoryPath);
                 m_restoreSucceeded = cecSettingsRestored && devicePropertiesRestored && directoryRemoved;
 
@@ -452,9 +476,14 @@ namespace
     private:
         bool m_devicePropertiesWasPresent;
         std::string m_devicePropertiesContents;
+        // Declared before the matching ...SnapshotCaptured member on purpose: that member is
+        // initialised by the readFile() call which fills this one, and members initialise in
+        // declaration order.
+        mode_t m_devicePropertiesMode;
         bool m_devicePropertiesSnapshotCaptured;
         bool m_cecSettingsWasPresent;
         std::string m_cecSettingsContents;
+        mode_t m_cecSettingsMode;
         bool m_cecSettingsSnapshotCaptured;
         bool m_cecSettingsDirectoryCreated;
         std::string m_cecSettingsDirectoryPath;
@@ -1019,6 +1048,13 @@ class HdmiCecSourceSettingsTest : public HdmiCecSourceTest {
 protected:
     bool m_devicePropertiesPresent;
     std::string m_devicePropertiesContents;
+    // The permissions the host's own /etc/device.properties carried when SetUp captured it.
+    // Held separately from the contents because the tests in this fixture do not merely read
+    // the file: loadSettings_* delete it and recreate it through an ofstream, which lands at
+    // 0666 & ~umask (0644 here).  Restoring the bytes while letting that mode stand would
+    // leave a host-global path permanently more permissive than this fixture found it, which
+    // is a change to the machine even though every assertion passed.
+    mode_t m_devicePropertiesMode;
     // Whether SetUp actually captured a snapshot. TearDown runs even when SetUp aborts on a
     // fatal assertion, and restoring from an uncaptured snapshot means "the file was absent",
     // which would delete a real /etc/device.properties this fixture never read.
@@ -1028,6 +1064,7 @@ protected:
         : HdmiCecSourceTest()
         , m_devicePropertiesPresent(false)
         , m_devicePropertiesContents()
+        , m_devicePropertiesMode(0)
         , m_devicePropertiesSnapshotCaptured(false)
     {
         
@@ -1039,8 +1076,11 @@ protected:
 
     void SetUp() override
     {
-        m_devicePropertiesSnapshotCaptured = readFile("/etc/device.properties", m_devicePropertiesPresent, m_devicePropertiesContents);
+        m_devicePropertiesSnapshotCaptured = readFile("/etc/device.properties", m_devicePropertiesPresent, m_devicePropertiesContents, m_devicePropertiesMode);
         ASSERT_TRUE(m_devicePropertiesSnapshotCaptured) << "Could not snapshot /etc/device.properties, so this test cannot safely provision it.";
+        // Provisioned without a mode, so the profile this fixture needs is written under
+        // whatever permissions the path already carries; the captured mode is kept for the
+        // restore, which is the only place it has to be reasserted.
         ASSERT_TRUE(writeFile("/etc/device.properties", "RDK_PROFILE=STB\n"));
     }
 
@@ -1052,7 +1092,10 @@ protected:
             return;
         }
 
-        EXPECT_TRUE(restoreFile("/etc/device.properties", m_devicePropertiesPresent, m_devicePropertiesContents));
+        // The captured mode goes back with the captured bytes: a test body in this fixture
+        // may have deleted and recreated the file at the ofstream default in between, so the
+        // mode on the path right now is this suite's, not the host's.
+        EXPECT_TRUE(restoreFile("/etc/device.properties", m_devicePropertiesPresent, m_devicePropertiesContents, m_devicePropertiesMode));
     }
 };
 
