@@ -191,7 +191,32 @@ VALGRIND_BIN="$(resolve_tool valgrind)"
 # stat is how the ancestry of every artifact path is checked (owner, mode, type) before a byte
 # is written to it.  It is coreutils, like find and mktemp above.
 STAT_BIN="$(resolve_tool stat)"
-readonly LCOV_BIN GENHTML_BIN GCOV_BIN FIND_BIN MKTEMP_BIN NM_BIN CMAKE_BIN VALGRIND_BIN STAT_BIN
+# timeout is how a hung suite becomes a reported outcome instead of a job the CI runner kills
+# with no diagnosis attached.  It is resolved HERE, alongside the other primitives, because
+# three call sites below reference it: an earlier revision described the resolution and the
+# --kill-after probe in a comment at the point of use but never performed either, so with
+# `set -u` in effect every suite run aborted with "TIMEOUT_BIN: unbound variable" the moment
+# the binary was about to start.  The sibling runner
+# entservices-hdmicecsink/Tests/run_coverage.sh sets the shape.
+TIMEOUT_BIN="$(resolve_tool timeout)"
+readonly LCOV_BIN GENHTML_BIN GCOV_BIN FIND_BIN MKTEMP_BIN NM_BIN CMAKE_BIN VALGRIND_BIN STAT_BIN TIMEOUT_BIN
+
+# --kill-after is desirable (a suite that ignores SIGTERM still dies) but is NOT universally
+# safe: this workspace's `timeout` is uutils coreutils, and with -k it reports a timeout as
+# exit 125 rather than GNU's 124 -- and 125 also means "timeout itself failed", so the two
+# become indistinguishable and a hang would be misreported as a broken invocation.  One cheap
+# probe settles it for this host instead of inferring it from a version string: a 1s bound on a
+# 3s sleep must yield exactly 124 before -k is used at all.
+TIMEOUT_KILL_AFTER=()
+if [ -n "$TIMEOUT_BIN" ]; then
+    timeout_probe=0
+    "$TIMEOUT_BIN" -k 1 1 sleep 3 >/dev/null 2>&1 || timeout_probe=$?
+    if [ "$timeout_probe" -eq 124 ]; then
+        TIMEOUT_KILL_AFTER=(-k 30)
+    fi
+    unset timeout_probe
+fi
+readonly TIMEOUT_KILL_AFTER
 
 # ------------------------------------------------------------------------------------
 # Environment inputs -- every one overridable, with the documented defaults.
@@ -1093,6 +1118,9 @@ preflight() {
     [ -n "$MKTEMP_BIN" ]  || die "mktemp not found on PATH."
     [ -n "$STAT_BIN" ]    || die "stat not found on PATH; it is how artifact paths are validated
        before anything is written to them."
+    [ -n "$TIMEOUT_BIN" ] || die "timeout not found on PATH; it is how a hung suite becomes a
+       reported outcome instead of a job the CI runner kills with no diagnosis attached.  It
+       ships with coreutils, so its absence means PATH is unusually restricted."
 
     # lcov must actually be runnable before anything else is believed about it.  A broken or
     # hostile configuration file makes EVERY invocation fail -- `lcov --version` included -- so
