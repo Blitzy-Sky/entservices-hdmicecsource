@@ -1,29 +1,29 @@
 """
 /**
  * @file TCID03_Get_Enabled_Status.py
- * @brief L3 vDevice testcase for the HDMI-CEC Source plugin. Reads the CEC enabled state.
+ * @brief L2 HDMI CEC functional testcase.
  *
  * @testcase TCID03_Get_Enabled_Status
- * @details Invokes getEnabled and checks the returned enabled flag is reported with success.
+ * @details Validates the 'TCID03_Get_Enabled_Status' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
  *
  * @precondition
- *  - A device under test - physical hardware or a QEMU target - is running WPEFramework
- *    with the org.rdk.HdmiCecSource plugin activated and reachable over JSON-RPC.
+ *  - Required plugin is active and reachable via JSON-RPC endpoint.
+ *  - Target environment is ready for HDMI CEC emulation/command execution.
  *
  * @dependencies
- *  - utils.py - shared endpoint resolution, curl dispatch and logging helpers
- *  - HdmiCECSource_Curl.py - the JSON-RPC command strings this module dispatches
- *  - SuitManager.py - registers and runs this module
+ *  - utils.py
+ *  - HdmiCECSource_Curl.py
+ *  - SuitManager.py
+ *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - org.rdk.HdmiCecSource.getEnabled answers with the values this scenario expects.
+ *  - API responses and scenario validations match expected values.
  *
  * @pass_criteria
- *  - Every response matches its expected value and run_test() returns True.
+ *  - Expected response equals actual response and testcase returns True.
  *
  * @failure_criteria
- *  - A response mismatch, a JSON-RPC or JSON parsing failure, an unreachable endpoint
- *    or an unavailable device-level prerequisite; run_test() then returns False.
+ *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
  */
 """
 

@@ -22,11 +22,15 @@
 #include <cerrno>
 #include <iostream>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <string>
+#include <utility>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -142,6 +146,118 @@ namespace
     // host.  It receives the FULL st_mode - never a masked copy - so that zero
     // unambiguously means "nothing was captured" (S_IFREG is always set on a snapshot of a
     // regular file, so a real snapshot can never be zero, not even for a 0000-mode file).
+    // Upper bound on a snapshot.  Both managed paths hold a short line or a small JSON object;
+    // the cap turns "something unexpected is at this host path" into a clean, named refusal
+    // instead of reading an arbitrary amount of it into this process.
+    static const std::string::size_type kMaxSnapshotBytes = 1024u * 1024u;
+
+    /*
+     * Custody of a host-global path, held for as long as an object needs it.
+     *
+     * The point is serialisation: while this lock is held, another cooperating writer of the
+     * same path waits, so the read-modify-write a fixture performs across its whole lifetime
+     * cannot interleave with one performed by anything else that takes the same lock.  Without
+     * it, "snapshot, provision, run, restore" is four unsynchronised operations and the restore
+     * can put a stale snapshot over an update somebody else made in between.
+     *
+     * It is REFERENCE-COUNTED PER PATH INSIDE THIS PROCESS, and that is not an optimisation.
+     * ScopedCecSettingsFile (a base-fixture member) and ScopedLifecycleFiles (built inside
+     * individual test bodies) both manage CEC_SETTING_ENABLED_FILE and are therefore alive at
+     * the same time.  flock() locks an open file DESCRIPTION, so two independent descriptors on
+     * one lock file taken by one thread would deadlock; sharing a single description behind a
+     * refcount makes the second acquisition a no-op instead.
+     *
+     * Acquisition is bounded.  A stale holder must not be able to hang a suite, so the wait
+     * gives up and Held() reports false; callers then proceed - every write is still atomic and
+     * every restore still verifies - and say so, which is strictly better than blocking for ever
+     * on a lock whose owner has gone.
+     *
+     * The lock file itself is created 0600 beside the managed path and is deliberately NOT
+     * removed on release.  Unlinking it would break the exclusion it exists for: a second
+     * process that had already opened the same name would then hold a lock on an unlinked inode
+     * while a third created a fresh one, and both would believe they had custody.  A zero-byte
+     * <path>.l1test.lock is therefore the one artifact this fixture leaves behind, and it is
+     * inert - it holds no content, is readable and writable only by its owner, and is reused
+     * rather than recreated by later runs.
+     */
+    class PathCustodyLock {
+    public:
+        explicit PathCustodyLock(const char* fileName)
+            : m_path(std::string(fileName) + ".l1test.lock")
+            , m_held(false)
+        {
+            std::lock_guard<std::mutex> guard(Mutex());
+            Registry_t& registry = Registry();
+            Registry_t::iterator existing = registry.find(m_path);
+            if (existing != registry.end()) {
+                // Already held by another object in this process: share it.
+                existing->second.second++;
+                m_held = true;
+                return;
+            }
+
+            const int fd = ::open(m_path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+            if (fd < 0) {
+                return;
+            }
+            for (int waitedMs = 0; waitedMs <= kLockWaitMs; waitedMs += 50) {
+                if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
+                    registry[m_path] = std::make_pair(fd, 1);
+                    m_held = true;
+                    return;
+                }
+                if (errno != EWOULDBLOCK) {
+                    break;
+                }
+                ::usleep(50 * 1000);
+            }
+            ::close(fd);
+        }
+
+        PathCustodyLock(const PathCustodyLock&) = delete;
+        PathCustodyLock& operator=(const PathCustodyLock&) = delete;
+
+        ~PathCustodyLock()
+        {
+            if (!m_held) {
+                return;
+            }
+            std::lock_guard<std::mutex> guard(Mutex());
+            Registry_t& registry = Registry();
+            Registry_t::iterator existing = registry.find(m_path);
+            if (existing == registry.end()) {
+                return;
+            }
+            if (--existing->second.second <= 0) {
+                (void)::flock(existing->second.first, LOCK_UN);
+                ::close(existing->second.first);
+                registry.erase(existing);
+            }
+        }
+
+        bool Held() const { return m_held; }
+
+    private:
+        typedef std::map<std::string, std::pair<int, int> > Registry_t;
+
+        static const int kLockWaitMs = 5000;
+
+        static Registry_t& Registry()
+        {
+            static Registry_t registry;
+            return registry;
+        }
+
+        static std::mutex& Mutex()
+        {
+            static std::mutex mutex;
+            return mutex;
+        }
+
+        std::string m_path;
+        bool m_held;
+    };
+
     static bool readFile(const char* fileName, bool& filePresent, std::string& fileContents, mode_t& fileMode)
     {
         filePresent = false;
@@ -166,15 +282,42 @@ namespace
             return false;
         }
 
+        // Bounded, and bounded on the DESCRIPTOR that was just validated: a file bigger than a
+        // snapshot this fixture is willing to hold cannot be restored faithfully, so it is
+        // refused before a byte of it is read rather than truncated silently.
+        if (static_cast<std::string::size_type>(fileStat.st_size) > kMaxSnapshotBytes) {
+            printf("File %s is %lld bytes, over the %lu byte snapshot cap; refusing to manage it\n",
+                fileName, static_cast<long long>(fileStat.st_size),
+                static_cast<unsigned long>(kMaxSnapshotBytes));
+            ::close(fd);
+            return false;
+        }
+
         filePresent = true;
         fileMode = fileStat.st_mode;
         char buffer[4096];
         ssize_t bytesRead = 0;
+        bool overCap = false;
         while ((bytesRead = ::read(fd, buffer, sizeof(buffer))) > 0) {
             fileContents.append(buffer, static_cast<std::string::size_type>(bytesRead));
+            // Re-checked while reading, because st_size above is a snapshot of a size that a
+            // concurrent writer can grow underneath this loop.
+            if (fileContents.size() > kMaxSnapshotBytes) {
+                overCap = true;
+                break;
+            }
         }
         const int readErrno = errno;
         ::close(fd);
+
+        if (overCap) {
+            printf("File %s grew past the %lu byte snapshot cap while it was being read\n",
+                fileName, static_cast<unsigned long>(kMaxSnapshotBytes));
+            filePresent = false;
+            fileContents.clear();
+            fileMode = 0;
+            return false;
+        }
 
         if (bytesRead < 0) {
             printf("File %s failed mid-read: %s\n", fileName, strerror(readErrno));
@@ -197,6 +340,15 @@ namespace
     // already carries preserved instead.
     static bool writeFile(const char* fileName, const std::string& fileContents, const mode_t capturedMode = 0)
     {
+        // Serialised against every other holder of this path's custody lock.  Shared with an
+        // enclosing guard when one is already holding it, so a nested write does not deadlock.
+        PathCustodyLock custody(fileName);
+        if (!custody.Held()) {
+            printf("File %s: proceeding WITHOUT the custody lock (it could not be acquired); the "
+                   "write below is still atomic, but it is not serialised against another writer\n",
+                fileName);
+        }
+
         mode_t fileMode = (capturedMode != 0) ? (capturedMode & 07777) : static_cast<mode_t>(0644);
         struct stat existingStat;
         if (lstat(fileName, &existingStat) == 0) {
@@ -209,25 +361,32 @@ namespace
                 fileMode = existingStat.st_mode & 07777;
             }
 
-            // std::remove, NOT unlink: this binary is linked with -Wl,-wrap,unlink, so a
-            // direct unlink() call is redirected to the Wraps mock and removes nothing -
-            // the O_EXCL open below would then fail with EEXIST.  std::remove reaches the
-            // real filesystem, and like unlink it removes the entry rather than following
-            // it, which is what the no-follow guarantee here needs.
-            if (std::remove(fileName) != 0) {
-                printf("File %s could not be replaced: %s\n", fileName, strerror(errno));
-                return false;
-            }
         } else if (errno != ENOENT) {
             printf("File %s could not be examined: %s\n", fileName, strerror(errno));
             return false;
         }
 
-        // O_EXCL after the unlink means this open creates the file or fails; it can never
-        // resolve to an entry planted between the two calls.
-        const int fd = ::open(fileName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, fileMode);
+        // WRITE TO A PRIVATE TEMPORARY, THEN PUBLISH BY RENAME.
+        //
+        // The previous form removed the target and then created it O_EXCL, which leaves the path
+        // ABSENT for a window: anything reading it in between - the plugin under test included,
+        // since loadSettings() branches on exactly that - sees a state no test asked for, and a
+        // concurrent creator can win the race and be clobbered.  rename() over an existing name
+        // is atomic, so a reader sees either the whole old file or the whole new one and never
+        // an absent or half-written path.  The temporary is made in the SAME directory, because
+        // rename cannot cross a filesystem boundary.
+        char temporaryPath[512];
+        snprintf(temporaryPath, sizeof(temporaryPath), "%s.l1test.%ld.tmp", fileName,
+            static_cast<long>(getpid()));
+        // std::remove, NOT unlink: this binary is linked with -Wl,-wrap,unlink, so a direct
+        // unlink() call is redirected to the Wraps mock and removes nothing - the O_EXCL open
+        // below would then fail with EEXIST.  std::remove reaches the real filesystem, and like
+        // unlink it removes the entry rather than following it.
+        (void)std::remove(temporaryPath);
+
+        const int fd = ::open(temporaryPath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (fd < 0) {
-            printf("File %s could not be created: %s\n", fileName, strerror(errno));
+            printf("File %s could not be staged at %s: %s\n", fileName, temporaryPath, strerror(errno));
             return false;
         }
 
@@ -246,13 +405,35 @@ namespace
             offset += static_cast<std::string::size_type>(bytesWritten);
         }
 
-        // fchmod rather than relying on the open mode, which the umask would have masked.
+        // fchmod rather than relying on the open mode, which the umask would have masked - and
+        // then fstat, because a fchmod that reported success on a filesystem that silently
+        // remaps permissions would otherwise hand the host back a file wearing the wrong ones
+        // while the restore claimed to have succeeded.
         if (written && (fchmod(fd, fileMode) != 0)) {
-            printf("File %s could not be restored to mode %o: %s\n", fileName, fileMode, strerror(errno));
+            printf("File %s could not be given mode %o: %s\n", fileName, fileMode, strerror(errno));
+            written = false;
+        }
+        struct stat stagedStat;
+        if (written && ((fstat(fd, &stagedStat) != 0) || ((stagedStat.st_mode & 07777) != (fileMode & 07777)))) {
+            printf("File %s was staged with mode %o instead of %o; refusing to publish it\n",
+                fileName, static_cast<unsigned>(stagedStat.st_mode & 07777), fileMode);
+            written = false;
+        }
+        if ((::close(fd) != 0) && written) {
+            printf("File %s failed on close: %s\n", fileName, strerror(errno));
             written = false;
         }
 
-        return (::close(fd) == 0) && written;
+        if (!written) {
+            (void)std::remove(temporaryPath);
+            return false;
+        }
+        if (::rename(temporaryPath, fileName) != 0) {
+            printf("File %s could not be published from %s: %s (the intended content is left there)\n",
+                fileName, temporaryPath, strerror(errno));
+            return false;
+        }
+        return true;
     }
 
     // Create the settings file's parent directory when it is absent (/opt/persistent
@@ -322,6 +503,33 @@ namespace
     // permissions it had rather than the permissions it happens to be wearing now.
     static bool restoreFile(const char* fileName, const bool wasPresent, const std::string& fileContents, const mode_t capturedMode)
     {
+        // Held across the whole restore, so the "is it still what we left?" report below and the
+        // write that follows it cannot be separated by another holder of the same lock.
+        PathCustodyLock custody(fileName);
+        if (!custody.Held()) {
+            printf("File %s: restoring WITHOUT the custody lock (it could not be acquired)\n", fileName);
+        }
+
+        // A restore puts a SNAPSHOT back.  If the path no longer holds what this fixture last
+        // left there, something outside this fixture's custody wrote it, and putting the snapshot
+        // back discards that write.  The host's own state is still what it asked for, so the
+        // snapshot is restored - leaving a test value on a host path would be worse - but the
+        // discarded content is named here instead of disappearing silently, which is the whole
+        // difference between a reported clobber and an invisible one.
+        bool currentlyPresent = false;
+        std::string currentContents;
+        mode_t currentMode = 0;
+        if (readFile(fileName, currentlyPresent, currentContents, currentMode)) {
+            const bool sameAsSnapshot = (currentlyPresent == wasPresent)
+                && (!currentlyPresent || (currentContents == fileContents));
+            if (!sameAsSnapshot) {
+                printf("File %s changed while this fixture had custody of it (now %s, %lu byte(s)); "
+                       "restoring the snapshot this fixture captured and discarding that change\n",
+                    fileName, currentlyPresent ? "present" : "absent",
+                    static_cast<unsigned long>(currentContents.size()));
+            }
+        }
+
         if (wasPresent) {
             return writeFile(fileName, fileContents, capturedMode);
         }
@@ -423,7 +631,15 @@ namespace
                 restored = removeCreatedDirectory(m_cecSettingsDirectoryCreated, m_cecSettingsDirectoryPath) && restored;
 
                 if (!restored) {
-                    printf("ScopedLifecycleFiles: host state could not be fully restored; see the errors above\n");
+                    // The verdict, not a printf.  A suite that leaves /etc/device.properties or
+                    // the CEC settings file holding a test value has changed the machine it ran
+                    // on, and the next test - or the next run, or the sibling plugin's suite -
+                    // reads that value.  A green result on top of that is a false negative, so
+                    // the failure is attached to the test that owned the fixture.  GoogleTest
+                    // attributes failures raised in a fixture destructor to the test itself.
+                    ADD_FAILURE() << "ScopedLifecycleFiles: host state could not be fully restored "
+                                     "(/etc/device.properties and/or " << CEC_SETTING_ENABLED_FILE
+                                  << "); see the diagnostics above.  The host is left modified.";
                 }
             }
         }
@@ -556,12 +772,20 @@ namespace
         // still attempted rather than abandoned at the first error.
         ~ScopedCecSettingsFile()
         {
+            // Failures here become the TEST's verdict rather than a line in a log: leaking
+            // cecData_2.json is exactly the residue that made this suite's coverage figure swing
+            // by 15 lines between runs, and a suite that cannot hand the host back must not
+            // report success.  GoogleTest attributes a failure raised in a fixture destructor to
+            // the test that was running.
             if (m_captured && !restoreFile(CEC_SETTING_ENABLED_FILE, m_wasPresent, m_contents, m_mode)) {
-                printf("ScopedCecSettingsFile: %s could not be restored; see the errors above\n",
-                    CEC_SETTING_ENABLED_FILE);
+                ADD_FAILURE() << "ScopedCecSettingsFile: " << CEC_SETTING_ENABLED_FILE
+                              << " could not be restored to the state this fixture found; see the "
+                                 "diagnostics above.  The host is left modified and the next test "
+                                 "will read the wrong settings.";
             }
             if (!removeCreatedDirectory(m_directoryCreated, m_directoryPath)) {
-                printf("ScopedCecSettingsFile: the directory this fixture created could not be removed\n");
+                ADD_FAILURE() << "ScopedCecSettingsFile: the directory this fixture created ("
+                              << m_directoryPath << ") could not be removed";
             }
         }
 

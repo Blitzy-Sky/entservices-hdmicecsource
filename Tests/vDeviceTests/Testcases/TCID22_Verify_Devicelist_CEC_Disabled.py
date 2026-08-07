@@ -1,39 +1,29 @@
 """
 /**
  * @file TCID22_Verify_Devicelist_CEC_Disabled.py
- * @brief L3 vDevice testcase for the HDMI-CEC Source plugin. Device list while the emulated CEC
- *        driver fails.
+ * @brief L2 HDMI CEC functional testcase.
  *
  * @testcase TCID22_Verify_Devicelist_CEC_Disabled
- * @details Posts driver open-failure and logical-address-failure documents to the vComponent,
- *          reads getEnabled and getDeviceList under that condition, then restores CEC with
- *          setEnabled true and re-reads the list.
+ * @details Validates the 'TCID22_Verify_Devicelist_CEC_Disabled' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
  *
  * @precondition
- *  - A device under test - physical hardware or a QEMU target - is running WPEFramework
- *    with the org.rdk.HdmiCecSource plugin activated and reachable over JSON-RPC.
- *  - The vComponent HDMI-CEC emulator is running and accepting YAML command documents.
+ *  - Required plugin is active and reachable via JSON-RPC endpoint.
+ *  - Target environment is ready for HDMI CEC emulation/command execution.
  *
  * @dependencies
- *  - utils.py - shared endpoint resolution, curl dispatch and logging helpers
- *  - HdmiCECSource_Curl.py - the JSON-RPC command strings this module dispatches
- *  - SuitManager.py - registers and runs this module
- *  - vcomponent_configurations/commands/ - Device_Setapi_Logic_Fail.yaml,
- *    Device_Setapi_Open_Fail.yaml
+ *  - utils.py
+ *  - HdmiCECSource_Curl.py
+ *  - SuitManager.py
+ *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - Each of these APIs answers with the values this scenario expects:
- *      org.rdk.HdmiCecSource.getEnabled
- *      org.rdk.HdmiCecSource.getDeviceList
- *      org.rdk.HdmiCecSource.setEnabled
- *  - Every vComponent command document is accepted before the APIs are exercised.
+ *  - API responses and scenario validations match expected values.
  *
  * @pass_criteria
- *  - Every response matches its expected value and run_test() returns True.
+ *  - Expected response equals actual response and testcase returns True.
  *
  * @failure_criteria
- *  - A response mismatch, a JSON-RPC or JSON parsing failure, an unreachable endpoint
- *    or a rejected vComponent command document; run_test() then returns False.
+ *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
  */
 """
 
@@ -64,7 +54,6 @@ def _post_hdmicec(yaml_file):
 def run_test():
     start_time = time.perf_counter()
 
-    #base_dir = "/tmp/vcomponent_configurations/commands"
     log_success("Negative scenario - calling getEnabled with driver status TRUE")
     curl_response = send_curl_command(
             HdmiCecSourceApis.get_enabled

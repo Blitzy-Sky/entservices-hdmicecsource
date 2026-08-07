@@ -179,34 +179,53 @@ lcov_function_coverage = 1
 
 # Specify if branch coverage data should be collected and processed.
 #
-# THE ONE VALUE THAT DIVERGES FROM THE PRISTINE WORKSPACE MODEL - AND, STATED PLAINLY, A
-# VALUE THAT NOTHING IN THIS REPOSITORY READS TODAY.
+# THE ONE VALUE THAT DIVERGES FROM THE PRISTINE WORKSPACE MODEL.  lcov collects line and
+# function data by default but NOT branch data, and branch visibility is what the >=80%
+# coverage work needs.
 #
-# Read honestly, this setting is intent, not mechanism:
-#   * `.github/workflows/L1-tests.yml` copies the *entservices-testframework* configuration
-#     (Tests/L1Tests/.lcovrc_l1 from that submodule) over ~/.lcovrc before capturing, and
-#     `L2-tests.yml` does the same with its .lcovrc_l2.  Neither ever reads THIS file, so
-#     enabling branch collection here does not change what CI produces.
-#   * lcov only reads a configuration file it is handed via `--config-file`, or a copy
-#     installed at ~/.lcovrc.  There is no coverage runner in this repository at this
-#     milestone to pass `--config-file`, so nothing does.
-#   * The `lcov_branch_coverage` spelling is DEPRECATED in lcov 2.x (the modern key is
-#     `branch_coverage`) and defaults to 0.  It is used anyway so that this file stays
-#     key-for-key aligned with the workspace model; when the workspace migrates, all copies
-#     should move together.
+# HOW THIS FILE IS CONSUMED
+# -------------------------
+# ../run_coverage.sh resolves this file by level and passes it as `--config-file` on its lcov
+# capture, lcov filter, genhtml and `lcov --summary` invocations, so lcov reads it INSTEAD OF
+# ~/.lcovrc and /etc/lcovrc.  That is the mechanism; everything below describes how the runner
+# keeps it in effect.
 #
-# So branch visibility for this plugin is DEVELOPER-OPT-IN, and the run-time override is the
-# authoritative mechanism - it wins regardless of spelling deprecation and regardless of
-# whether this file was read at all:
-#     rm -f ~/.lcovrc          # CI plants a branch-disabled copy there
+# HOW IT IS NOT CONSUMED
+# ----------------------
+# No CI path reads it.  `.github/workflows/L1-tests.yml` copies the *entservices-testframework*
+# configuration (that submodule's Tests/L1Tests/.lcovrc_l1) over ~/.lcovrc before capturing,
+# and `L2-tests.yml` does the same with its .lcovrc_l2; both of those set branch collection to
+# 0, so CI discards branch data whatever this file says.  Correcting that at source would mean
+# editing the test framework, which is out of scope here.
+#
+# WHAT THE RUNNER DOES WITH ~/.lcovrc - CAPTURE AND RESTORE, NEVER DELETION
+# ------------------------------------------------------------------------
+# lcov reads $HOME/.lcovrc silently whenever it exists, so the runner takes it out of the
+# picture for the duration of the run - and puts it back.  Whatever is at that path (regular
+# file, symlink or directory) is MOVED ASIDE into a private mode-0700 temporary directory
+# before the first lcov invocation and MOVED BACK from a single cleanup trap installed at
+# start-up, which services EXIT, INT, TERM and HUP - so the restore happens on success, on a
+# gate failure and on Ctrl-C alike.  It is a move in both directions, never a copy and never a
+# deletion: a symlink comes back a symlink and a directory keeps its contents.  The stash path
+# is logged, so even a run killed with SIGKILL - the one signal no trap can service - leaves a
+# named, recoverable copy rather than a hole.  /etc/lcovrc is never touched, and an unset HOME
+# is not an error because there is then nothing to move.
+#
+# WHY THE RUNNER ALSO PASSES --rc branch_coverage=1
+# -------------------------------------------------
+# Not redundancy.  The `lcov_branch_coverage` spelling used below is DEPRECATED in lcov 2.x
+# (the modern key is `branch_coverage`) and defaults to 0, so this file alone could one day
+# stop enabling branch data silently.  A command-line `--rc branch_coverage=1` outranks
+# ~/.lcovrc, /etc/lcovrc and --config-file alike and is therefore the guarantee; this file
+# supplies the settings the repository has chosen.  The legacy spelling is kept so that this
+# file stays key-for-key aligned with the other copies in the workspace; when the workspace
+# migrates, all copies should move together.
+#
+# Reproducing the runner's steps by hand:
 #     lcov --config-file Tests/L1Tests/.lcovrc_l1 --rc branch_coverage=1 \
 #          -c -o coverage.info -d <build-dir>
 # Pass the same two options to the matching `lcov -r`, `genhtml` and `lcov --summary` steps,
 # with the exclusion globs taken verbatim from the workflow, and apply the bar as
 # `lcov --summary <trace> --fail-under-lines 80` (lcov 2.0-1 rejects --fail-under-lines
 # without an operation).
-#
-# What this file is for, then: it records the intended configuration in the repository next
-# to the tests it applies to, so the recipe above and any coverage runner added later have
-# one agreed source to point --config-file at instead of each inventing its own settings.
 lcov_branch_coverage = 1

@@ -1,35 +1,29 @@
 """
 /**
  * @file TCID24_Standby_Userdef_Busstatus.py
- * @brief L3 vDevice testcase for the HDMI-CEC Source plugin. Standby over a user-defined CEC
- *        exchange with an altered bus status.
+ * @brief L2 HDMI CEC functional testcase.
  *
  * @testcase TCID24_Standby_Userdef_Busstatus
- * @details Posts bus-status and user-defined CEC message documents to the vComponent and checks
- *          sendStandbyMessage behaves as expected against that bus state.
+ * @details Validates the 'TCID24_Standby_Userdef_Busstatus' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
  *
  * @precondition
- *  - A device under test - physical hardware or a QEMU target - is running WPEFramework
- *    with the org.rdk.HdmiCecSource plugin activated and reachable over JSON-RPC.
- *  - The vComponent HDMI-CEC emulator is running and accepting YAML command documents.
+ *  - Required plugin is active and reachable via JSON-RPC endpoint.
+ *  - Target environment is ready for HDMI CEC emulation/command execution.
  *
  * @dependencies
- *  - utils.py - shared endpoint resolution, curl dispatch and logging helpers
- *  - HdmiCECSource_Curl.py - the JSON-RPC command strings this module dispatches
- *  - SuitManager.py - registers and runs this module
- *  - vcomponent_configurations/commands/ - Device_Bus_Status.yaml,
- *    Device_CEC_Message_Userdef.yaml
+ *  - utils.py
+ *  - HdmiCECSource_Curl.py
+ *  - SuitManager.py
+ *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - org.rdk.HdmiCecSource.sendStandbyMessage answers with the values this scenario expects.
- *  - Every vComponent command document is accepted before the APIs are exercised.
+ *  - API responses and scenario validations match expected values.
  *
  * @pass_criteria
- *  - Every response matches its expected value and run_test() returns True.
+ *  - Expected response equals actual response and testcase returns True.
  *
  * @failure_criteria
- *  - A response mismatch, a JSON-RPC or JSON parsing failure, an unreachable endpoint
- *    or a rejected vComponent command document; run_test() then returns False.
+ *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
  */
 """
 

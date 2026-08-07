@@ -1,36 +1,29 @@
 """
 /**
  * @file TCID17_Menu_Language_CECversion_Flow.py
- * @brief L3 vDevice testcase for the HDMI-CEC Source plugin. Menu-language and CEC-version
- *        exchange flow.
+ * @brief L2 HDMI CEC functional testcase.
  *
  * @testcase TCID17_Menu_Language_CECversion_Flow
- * @details Posts menu-language, CEC-version and device-removal documents to the vComponent and
- *          reads getDeviceList before and after to confirm the topology tracks the emulated
- *          exchanges.
+ * @details Validates the 'TCID17_Menu_Language_CECversion_Flow' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
  *
  * @precondition
- *  - A device under test - physical hardware or a QEMU target - is running WPEFramework
- *    with the org.rdk.HdmiCecSource plugin activated and reachable over JSON-RPC.
- *  - The vComponent HDMI-CEC emulator is running and accepting YAML command documents.
+ *  - Required plugin is active and reachable via JSON-RPC endpoint.
+ *  - Target environment is ready for HDMI CEC emulation/command execution.
  *
  * @dependencies
- *  - utils.py - shared endpoint resolution, curl dispatch and logging helpers
- *  - HdmiCECSource_Curl.py - the JSON-RPC command strings this module dispatches
- *  - SuitManager.py - registers and runs this module
- *  - vcomponent_configurations/commands/ - Device_Get_CEC_Version.yaml,
- *    Device_Get_Menu_Language.yaml, Device_Remove.yaml, Device_Set_Menu_Language.yaml
+ *  - utils.py
+ *  - HdmiCECSource_Curl.py
+ *  - SuitManager.py
+ *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - org.rdk.HdmiCecSource.getDeviceList answers with the values this scenario expects.
- *  - Every vComponent command document is accepted before the APIs are exercised.
+ *  - API responses and scenario validations match expected values.
  *
  * @pass_criteria
- *  - Every response matches its expected value and run_test() returns True.
+ *  - Expected response equals actual response and testcase returns True.
  *
  * @failure_criteria
- *  - A response mismatch, a JSON-RPC or JSON parsing failure, an unreachable endpoint
- *    or a rejected vComponent command document; run_test() then returns False.
+ *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
  */
 """
 
@@ -62,7 +55,6 @@ def _post_hdmicec(yaml_file):
 def run_test():
     start_time = time.perf_counter()
 
-    #base_dir = "/tmp/vcomponent_configurations/commands"
     base_dir = "/tmp"
     time.sleep(2)
     _post_hdmicec("Device_Get_Menu_Language.yaml")

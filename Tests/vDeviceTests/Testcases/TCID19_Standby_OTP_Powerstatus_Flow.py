@@ -1,37 +1,29 @@
 """
 /**
  * @file TCID19_Standby_OTP_Powerstatus_Flow.py
- * @brief L3 vDevice testcase for the HDMI-CEC Source plugin. Standby, one-touch-play and power-
- *        status reporting flow.
+ * @brief L2 HDMI CEC functional testcase.
  *
  * @testcase TCID19_Standby_OTP_Powerstatus_Flow
- * @details Posts power-status request and report documents to the vComponent, then drives
- *          sendStandbyMessage followed by performOTPAction and checks both succeed.
+ * @details Validates the 'TCID19_Standby_OTP_Powerstatus_Flow' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
  *
  * @precondition
- *  - A device under test - physical hardware or a QEMU target - is running WPEFramework
- *    with the org.rdk.HdmiCecSource plugin activated and reachable over JSON-RPC.
- *  - The vComponent HDMI-CEC emulator is running and accepting YAML command documents.
+ *  - Required plugin is active and reachable via JSON-RPC endpoint.
+ *  - Target environment is ready for HDMI CEC emulation/command execution.
  *
  * @dependencies
- *  - utils.py - shared endpoint resolution, curl dispatch and logging helpers
- *  - HdmiCECSource_Curl.py - the JSON-RPC command strings this module dispatches
- *  - SuitManager.py - registers and runs this module
- *  - vcomponent_configurations/commands/ - Device_Get_Power_Status.yaml,
- *    Device_Report_Power_Status.yaml
+ *  - utils.py
+ *  - HdmiCECSource_Curl.py
+ *  - SuitManager.py
+ *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - Each of these APIs answers with the values this scenario expects:
- *      org.rdk.HdmiCecSource.sendStandbyMessage
- *      org.rdk.HdmiCecSource.performOTPAction
- *  - Every vComponent command document is accepted before the APIs are exercised.
+ *  - API responses and scenario validations match expected values.
  *
  * @pass_criteria
- *  - Every response matches its expected value and run_test() returns True.
+ *  - Expected response equals actual response and testcase returns True.
  *
  * @failure_criteria
- *  - A response mismatch, a JSON-RPC or JSON parsing failure, an unreachable endpoint
- *    or a rejected vComponent command document; run_test() then returns False.
+ *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
  */
 """
 
@@ -64,7 +56,6 @@ def run_test():
     start_time = time.perf_counter()
 
     log_info(" Set the devices to standby mode and hit the sendStandbyMessage curl command again. Then wake up the remote device using otp feature.First, set the device to standby mode via emulation. Next, hit the curl command for sendStandbyMessage and send corresponding cec messages using sendMessage API to hal. Then hit the curl command for perform OTP Action and send corresponding cec messages to hal.Verify the thunder logs for more info")
-    #base_dir = "/tmp/vcomponent_configurations/commands"
 
     time.sleep(1)
     log_info("Send standby curl request being made to source device")
