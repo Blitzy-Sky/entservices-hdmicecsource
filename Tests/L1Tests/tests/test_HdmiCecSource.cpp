@@ -494,6 +494,95 @@ namespace
         bool m_directoryRemoved = false;
     };
 
+    // Custody of the CEC settings file ALONE, for the whole of every test in this suite.
+    //
+    // WHY THIS EXISTS
+    // ---------------
+    // HdmiCecSourceImplementation.cpp:65 defines
+    //     CEC_SETTING_ENABLED_FILE "/opt/persistent/ds/cecData_2.json"
+    // and loadSettings() has two arms: it reads the file when it opens
+    // (HdmiCecSourceImplementation.cpp:797-867) and CREATES IT WITH DEFAULTS when it does not
+    // (lines 868-888, 15 instrumented lines).  The path is host-global, outside the build
+    // tree, and this suite both reads and writes it.  Nothing took custody of it, so which
+    // arm ran during a test's plugin initialisation depended on whether an EARLIER run of
+    // this or the sibling plugin had left the file behind.
+    //
+    // The consequence was a coverage figure that moved without any test changing.  Measured
+    // through Tests/run_coverage.sh l1, same 121/121 green suite both times:
+    //     file absent  -> HdmiCecSourceImplementation.cpp 718/834 = 86.09%
+    //     file present -> HdmiCecSourceImplementation.cpp 703/834 = 84.29%
+    // and the 15-line difference is exactly lines 870-888, the create-with-defaults arm.  A
+    // measurement that swings on residue is not a measurement, so the state is now owned.
+    //
+    // WHAT IT DOES
+    // ------------
+    // Captures the host's file (present/absent, contents, full st_mode), makes sure the
+    // parent directory exists, and then REMOVES the file so that every test in this suite
+    // starts from the documented first-boot state: no settings written yet.  On destruction
+    // it puts back exactly what it found - contents AND permissions - or removes the file
+    // again if there was none.  Capture-and-restore, never unconditional deletion, so a
+    // developer's or a device's real settings survive a test run.
+    //
+    // WHY A MEMBER OF THE BASE FIXTURE AND NOT SetUp()
+    // ------------------------------------------------
+    // GoogleTest runs the fixture constructors (base, then derived) BEFORE SetUp(), and this
+    // suite's derived fixtures initialise the plugin - which is what calls loadSettings() -
+    // in their constructor bodies.  A SetUp() override would therefore run too late to decide
+    // which arm the plugin took.  Held as a member of HdmiCecSourceTest it is constructed
+    // before any derived constructor body and destroyed after every derived destructor, which
+    // is the exact window needed.  No existing test body is modified by this.
+    class ScopedCecSettingsFile {
+    public:
+        ScopedCecSettingsFile()
+            : m_wasPresent(false)
+            , m_contents()
+            , m_mode(0)
+            , m_captured(readFile(CEC_SETTING_ENABLED_FILE, m_wasPresent, m_contents, m_mode))
+            , m_directoryCreated(false)
+            , m_directoryPath()
+            , m_prepared(false)
+        {
+            if (m_captured && ensureParentDirectory(CEC_SETTING_ENABLED_FILE, m_directoryCreated, m_directoryPath)) {
+                // Absent is the state under test: it is what makes loadSettings() take its
+                // create-with-defaults arm, deterministically, for every test.
+                m_prepared = restoreFile(CEC_SETTING_ENABLED_FILE, false, std::string(), 0);
+            }
+        }
+
+        ScopedCecSettingsFile(const ScopedCecSettingsFile&) = delete;
+        ScopedCecSettingsFile& operator=(const ScopedCecSettingsFile&) = delete;
+
+        // A destructor cannot throw, so a failure is reported and the remaining steps are
+        // still attempted rather than abandoned at the first error.
+        ~ScopedCecSettingsFile()
+        {
+            if (m_captured && !restoreFile(CEC_SETTING_ENABLED_FILE, m_wasPresent, m_contents, m_mode)) {
+                printf("ScopedCecSettingsFile: %s could not be restored; see the errors above\n",
+                    CEC_SETTING_ENABLED_FILE);
+            }
+            if (!removeCreatedDirectory(m_directoryCreated, m_directoryPath)) {
+                printf("ScopedCecSettingsFile: the directory this fixture created could not be removed\n");
+            }
+        }
+
+        // True when the host's state was snapshotted AND the file was put into the known
+        // starting state.  Tests that care about which loadSettings() arm ran assert on it.
+        bool IsPrepared() const { return m_captured && m_prepared; }
+
+        bool WasPresentOnTheHost() const { return m_wasPresent; }
+
+    private:
+        bool m_wasPresent;
+        std::string m_contents;
+        // Declared before m_captured on purpose: m_captured is initialised by the readFile()
+        // call that fills this one, and members initialise in declaration order.
+        mode_t m_mode;
+        bool m_captured;
+        bool m_directoryCreated;
+        std::string m_directoryPath;
+        bool m_prepared;
+    };
+
     // Local stack-safe connection double used to drive the private remote-connection notification sink.
     class RemoteConnectionDouble final : public RPC::IRemoteConnection {
     public:
@@ -820,6 +909,13 @@ class NotificationHandler : public Exchange::IHdmiCecSource::INotification {
 
 class HdmiCecSourceTest : public ::testing::Test {
 protected:
+    // FIRST member, deliberately.  Members are constructed in declaration order (after base
+    // classes, before this constructor's body) and destroyed in reverse, so declaring it here
+    // gives it the widest possible window: the CEC settings file is in its known state before
+    // anything else in this fixture exists, and the host's own file is not put back until
+    // every other member has been destroyed.  See ScopedCecSettingsFile for why custody of
+    // this one path matters and what it measured before it was owned.
+    ScopedCecSettingsFile cecSettingsFileCustody;
     Core::ProxyType<Plugin::HdmiCecSource> plugin;
     Core::JSONRPC::Handler& handler;
     DECL_CORE_JSONRPC_CONX connection;
@@ -1572,6 +1668,128 @@ TEST_F(HdmiCecSourceTest, NotSupportedPlugin)
     EXPECT_EQ(string(""), plugin->Initialize(&service));
     plugin->Deinitialize(&service);
 
+    EXPECT_TRUE(lifecycleFiles.Restore());
+}
+
+// ---------------------------------------------------------------------------------------
+// loadSettings(): BOTH arms, pinned explicitly rather than left to whatever the host's CEC
+// settings file happened to contain.
+//
+// These are new adjacent cases, not edits to anything above.  They exist because the arm
+// that ran used to be decided by residue: the settings file is a host-global path
+// (/opt/persistent/ds/cecData_2.json) that this suite and the sibling sink suite both write,
+// and with it left behind by an earlier run the create-with-defaults arm
+// (HdmiCecSourceImplementation.cpp:868-888) never executed - 15 lines of coverage appearing
+// and disappearing between identical green runs.  ScopedCecSettingsFile now owns that path
+// for every fixture in this suite and hands each test the absent state; these two tests
+// assert what each arm actually does, so the behaviour is pinned as well as the state.
+//
+// They live in HdmiCecSourceTest rather than a derived fixture because the file has to be
+// arranged BEFORE the plugin initialises, and the derived fixtures initialise it in their
+// constructors.  Here the test body owns the whole lifecycle.
+//
+// SHUTDOWN ORDER IS LOAD-BEARING - setEnabled(false) BEFORE Deinitialize
+// ----------------------------------------------------------------------
+// Both tests wind CEC down with setEnabled(false) and only then call Deinitialize, which is
+// the same order HdmiCecSourceInitializedTest's destructor uses.  That is not a stylistic
+// choice; the alternative crashes the process, and it does so inside production code:
+//
+//   Thread 1 (poll)  HdmiCecSourceImplementation::addDevice(int)   <- SIGSEGV
+//   Thread 6 (main)  ~HdmiCecSourceImplementation -> setEnabledInternal -> CECDisable
+//                    -> std::thread::join()
+//
+// addDevice() (HdmiCecSourceImplementation.cpp:499-521) walks _hdmiCecSourceNotifications
+// WITHOUT taking _adminLock, while Unregister() (:480-495) takes _adminLock, calls Release()
+// on the notification and erase()s it from that same list.  Deinitialize unregisters, so a
+// poll thread that reaches addDevice at that moment iterates a list being erased underneath
+// it and dispatches through a pointer that has already been released.  Observed as a
+// reproducible SIGSEGV (core inspected, stack above) when a test leaves CEC enabled long
+// enough for the poll thread to discover a device before Deinitialize runs; the pre-existing
+// tests avoid it because every fixture disables CEC first, which JOINS the poll and update
+// threads before anything is unregistered.
+//
+// This is a production defect and Directive 6 puts production source out of scope, so it is
+// recorded here and in Tests/README.md rather than fixed.  THE REQUIRED PRODUCTION CHANGE:
+// take _adminLock around the notification-list traversal in addDevice() and removeDevice()
+// (and dispatch on a copy taken under the lock), the way the rest of that class already does.
+// ---------------------------------------------------------------------------------------
+
+// Arm 1: no settings file - the first-boot state.  loadSettings() must create the file and
+// write its documented defaults into it, and the plugin must come up carrying those defaults.
+//
+// ScopedLifecycleFiles is used for the snapshot/restore of both process-global lifecycle
+// files, exactly as NotSupportedPlugin above does; it provisions the settings file as part of
+// that, so the file is removed again here to reach the state under test.  Putting the host's
+// own file back is still that object's job.
+TEST_F(HdmiCecSourceTest, LoadSettingsCreatesDefaultsWhenTheSettingsFileIsAbsent)
+{
+    ASSERT_TRUE(cecSettingsFileCustody.IsPrepared())
+        << "the fixture could not put " << CEC_SETTING_ENABLED_FILE << " into the absent state";
+
+    ScopedLifecycleFiles lifecycleFiles;
+    ASSERT_TRUE(lifecycleFiles.IsValid()) << "Could not snapshot the process-global lifecycle files.";
+
+    removeFile(CEC_SETTING_ENABLED_FILE);
+
+    EXPECT_EQ(string(""), plugin->Initialize(&service));
+
+    // The observable effect of this arm is the file it leaves behind: it did not exist before
+    // Initialize and it carries all four settings labels afterwards.
+    bool present = false;
+    std::string contents;
+    mode_t mode = 0;
+    ASSERT_TRUE(readFile(CEC_SETTING_ENABLED_FILE, present, contents, mode));
+    EXPECT_TRUE(present) << "loadSettings() must persist the defaults it invented";
+    EXPECT_NE(std::string::npos, contents.find("cecEnabled"));
+    EXPECT_NE(std::string::npos, contents.find("cecOTPEnabled"));
+    EXPECT_NE(std::string::npos, contents.find("cecOSDName"));
+    EXPECT_NE(std::string::npos, contents.find("cecVendorId"));
+
+    // And the defaults are in force in the running plugin: this arm assigns
+    // cecOTPSettingEnabled = true unconditionally, which getOTPEnabled reads directly.
+    EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("getOTPEnabled"), _T("{}"), response));
+    EXPECT_NE(std::string::npos, response.find("\"enabled\":true"));
+
+    // Disable first, so CECDisable joins the poll and update threads before Deinitialize
+    // unregisters the notification.  See the note above this pair of tests.
+    EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("setEnabled"), _T("{\"enabled\": false}"), response));
+    EXPECT_EQ(response, string("{\"success\":true}"));
+    plugin->Deinitialize(&service);
+    EXPECT_TRUE(lifecycleFiles.Restore());
+}
+
+// Arm 2: a complete settings file already on disk.  loadSettings() must READ it and honour the
+// values it finds rather than overwriting them with defaults.  Both discriminators here are
+// deliberately the opposite of what the create-with-defaults arm would produce - OTP disabled
+// where the default is enabled, and an OSD name no default would invent - so a silent
+// fall-through to arm 1 fails this test rather than passing it quietly.
+TEST_F(HdmiCecSourceTest, LoadSettingsHonoursAnExistingSettingsFile)
+{
+    ASSERT_TRUE(cecSettingsFileCustody.IsPrepared())
+        << "the fixture could not put " << CEC_SETTING_ENABLED_FILE << " into the absent state";
+
+    ScopedLifecycleFiles lifecycleFiles;
+    ASSERT_TRUE(lifecycleFiles.IsValid()) << "Could not snapshot the process-global lifecycle files.";
+
+    // Every label present, so the read arm's four "label missing" sub-branches are not taken
+    // and no rewrite of the file is triggered either.
+    ASSERT_TRUE(writeFile(CEC_SETTING_ENABLED_FILE,
+        "{\"cecEnabled\":true,\"cecOTPEnabled\":false,\"cecOSDName\":\"L1ReadArm\",\"cecVendorId\":1193046}"));
+
+    EXPECT_EQ(string(""), plugin->Initialize(&service));
+
+    EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("getOTPEnabled"), _T("{}"), response));
+    EXPECT_NE(std::string::npos, response.find("\"enabled\":false"))
+        << "cecOTPEnabled:false from the file was not honoured; response was " << response;
+
+    EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("getOSDName"), _T("{}"), response));
+    EXPECT_NE(std::string::npos, response.find("L1ReadArm"))
+        << "cecOSDName from the file was not honoured; response was " << response;
+
+    // Same ordering as arm 1, and for the same reason.
+    EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("setEnabled"), _T("{\"enabled\": false}"), response));
+    EXPECT_EQ(response, string("{\"success\":true}"));
+    plugin->Deinitialize(&service);
     EXPECT_TRUE(lifecycleFiles.Restore());
 }
 

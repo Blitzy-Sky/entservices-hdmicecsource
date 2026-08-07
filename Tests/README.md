@@ -57,3 +57,53 @@ uses: rdkcentral/entservices-deviceanddisplay/.github/workflows/L1-tests.yml@top
 c/ changes in individual entservices-* repo only
 no changes required
 ```
+
+# Findings recorded by the test suites (not fixed here)
+
+Production and implementation source is out of scope for the test-coverage work, so defects
+found in it while writing tests are recorded rather than repaired. Each entry names the exact
+production change that would be required.
+
+### Unsynchronised notification dispatch in `addDevice()` / `removeDevice()` — SIGSEGV
+
+`HdmiCecSourceImplementation::addDevice(int)` and `removeDevice(int)`
+(`plugin/HdmiCecSourceImplementation.cpp`) walk `_hdmiCecSourceNotifications` and dispatch
+through each entry **without taking `_adminLock`**. `Unregister()` in the same file takes
+`_adminLock`, calls `Release()` on the notification and `erase()`s it from that same list. The
+device-poll thread calls `addDevice()`, and `Deinitialize` unregisters on the main thread, so
+the two can overlap:
+
+```
+Thread 1 (poll)  HdmiCecSourceImplementation::addDevice(int)              <- SIGSEGV
+Thread 6 (main)  ~HdmiCecSourceImplementation -> setEnabledInternal
+                 -> CECDisable -> std::thread::join()
+```
+
+Reproduced deliberately (core dumped and inspected) by leaving CEC enabled long enough for the
+poll thread to discover a device and then calling `Deinitialize` without disabling CEC first.
+The existing L1 tests never see it because every fixture disables CEC before deinitialising,
+and `CECDisable()` joins the poll and update threads before anything is unregistered — so the
+ordering that keeps the suite green is load-bearing, not incidental. The two `loadSettings`
+tests in `L1Tests/tests/test_HdmiCecSource.cpp` follow the same order for that reason, and say
+so at the point of use.
+
+**Required production change:** hold `_adminLock` across the notification-list traversal in
+`addDevice()` and `removeDevice()` — dispatching from a copy taken under the lock, as the rest
+of that class already does — so a notification cannot be released and erased while another
+thread is iterating it.
+
+### Host-global CEC settings file has no owner outside the test fixtures
+
+`CEC_SETTING_ENABLED_FILE` is `/opt/persistent/ds/cecData_2.json`, a fixed path outside any
+build tree that both this plugin's suite and the sink plugin's suite read and write.
+`loadSettings()` has two arms — read the file when it opens, create it with defaults when it
+does not — so whichever arm ran during a test used to depend on what an earlier run of either
+suite had left behind. Measured through `Tests/run_coverage.sh l1`, same green suite both
+times: `HdmiCecSourceImplementation.cpp` at 718/834 (86.1%) with the file absent and 703/834
+(84.3%) with it present, the 15-line difference being exactly the create-with-defaults arm.
+
+This one is fixed test-side: `ScopedCecSettingsFile` in `test_HdmiCecSource.cpp` takes custody
+of the path for every fixture in the suite (capture, put into the documented first-boot state,
+restore exactly what was found), and two adjacent tests pin the behaviour of each arm. Both
+run orders now report identical per-file figures and identical uncovered-line sets. No
+production change is required.
