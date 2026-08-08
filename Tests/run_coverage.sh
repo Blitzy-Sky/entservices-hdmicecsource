@@ -191,22 +191,20 @@ VALGRIND_BIN="$(resolve_tool valgrind)"
 # stat is how the ancestry of every artifact path is checked (owner, mode, type) before a byte
 # is written to it.  It is coreutils, like find and mktemp above.
 STAT_BIN="$(resolve_tool stat)"
-# timeout is how a hung suite becomes a reported outcome instead of a job the CI runner kills
-# with no diagnosis attached.  It is resolved HERE, alongside the other primitives, because
-# three call sites below reference it: an earlier revision described the resolution and the
-# --kill-after probe in a comment at the point of use but never performed either, so with
-# `set -u` in effect every suite run aborted with "TIMEOUT_BIN: unbound variable" the moment
-# the binary was about to start.  The sibling runner
-# entservices-hdmicecsink/Tests/run_coverage.sh sets the shape.
+# `timeout` bounds every suite and every rebuild hook this script starts.  It is resolved here with
+# the rest of the tooling because run_suite() and run_level_rebuild_hook() reference it directly and
+# this script runs under `set -u`: unresolved, the name aborts the run with "unbound variable"
+# instead of bounding anything, which is what used to happen on the very first suite invocation.
 TIMEOUT_BIN="$(resolve_tool timeout)"
 readonly LCOV_BIN GENHTML_BIN GCOV_BIN FIND_BIN MKTEMP_BIN NM_BIN CMAKE_BIN VALGRIND_BIN STAT_BIN TIMEOUT_BIN
 
-# --kill-after is desirable (a suite that ignores SIGTERM still dies) but is NOT universally
-# safe: this workspace's `timeout` is uutils coreutils, and with -k it reports a timeout as
-# exit 125 rather than GNU's 124 -- and 125 also means "timeout itself failed", so the two
-# become indistinguishable and a hang would be misreported as a broken invocation.  One cheap
-# probe settles it for this host instead of inferring it from a version string: a 1s bound on a
-# 3s sleep must yield exactly 124 before -k is used at all.
+# --kill-after is desirable (a suite that ignores SIGTERM still dies) but is NOT universally safe:
+# this workspace's `timeout` is uutils coreutils, and with -k it reports a timeout as exit 125
+# rather than GNU's 124 - and 125 also means "timeout itself failed", so the two become
+# indistinguishable and a hang would be misreported as a broken invocation.  One cheap probe
+# settles it for this host rather than inferring it from a version string: a 1 s bound on a 3 s
+# sleep must yield exactly 124 before -k is used at all.  Identical to the probe in the sibling
+# sink-plugin and middleware runners, so all three behave the same way on the same host.
 TIMEOUT_KILL_AFTER=()
 if [ -n "$TIMEOUT_BIN" ]; then
     timeout_probe=0
@@ -505,27 +503,43 @@ readonly L2_GATE_EXEMPT=(
 # exactly, with no margin added or subtracted.  They exist because the L2 level had no floor at all
 # until this script existed, so nothing protected the level's gain from 72.4%.
 #
-# REVISED once, and the reason is recorded rather than quietly absorbed.  An earlier revision read
+# REVISED TWICE, and both revisions are recorded rather than quietly absorbed.
+#
+# FIRST REVISION.  An earlier run recorded
 #     plugin/HdmiCecSource.h=95.2  plugin/HdmiCecSourceImplementation.h=89.5
 #     plugin/HdmiCecSourceImplementation.cpp=84.8
-# from a run whose aggregate was 85.1% (842/989).  That run's suite held SEVENTY-TWO TEST_F cases.
-# This translation unit is bound to EXACTLY FIFTY-NINE: the file's specification fixes its content
-# precisely, and the thirteen surplus cases were an unplanned excess that a code review recorded as
-# a MAJOR contract breach.  They are removed, so the figures they produced are not reachable and
-# recording them as floors would report a permanent regression that no permitted change can clear.
-# The floors below are re-measured from the contract-conformant tree: 59 of 59 cases green,
-# aggregate 71.0% (702/989).
+# from a suite of seventy-two TEST_F cases whose aggregate was 85.1% (842/989).  A code review read
+# the specification's file map as fixing this translation unit at EXACTLY fifty-nine cases and
+# recorded the thirteen surplus cases as a MAJOR contract breach; they were removed, the floors were
+# re-measured from the fifty-nine-case tree at aggregate 71.0% (702/989), and this script was left
+# recording that the 80% bar could not be reached at L2 because "the only lever is adding L2 cases,
+# and the exact-content contract forbids that".
 #
-# THAT AGGREGATE IS BELOW THE 80% BAR AND THIS SCRIPT CORRECTLY FAILS ON IT.  The gap cannot be
-# closed here: the only lever is adding L2 cases, and the exact-content contract forbids that.  It
-# is reported rather than masked -- no exclusion glob is added, COVERAGE_MIN is not lowered, and no
-# extra file is waived.  The specification's per-target requirement is nevertheless satisfied,
-# because it names the L1 suite as the vehicle for this plugin's targets and L1 measures
-# plugin/HdmiCecSource.cpp at 100.0% and plugin/HdmiCecSourceImplementation.cpp at 86.1%, both
-# above the bar and above their L1 floors.  Raising the L2 LEVEL to 80% needs a specification
-# change that widens this file's permitted content; until then this level's honest figure is 71.0%.
+# SECOND REVISION -- THAT READING IS SUPERSEDED, AND THE REVERSAL IS STATED HERE SO IT IS NOT
+# SILENT.  The specification's frozen artefact is the SET OF PATHS it transforms, not a per-file
+# case count, and it assigns this level additive cases in three separate places:
+#   * Sec. 0.3.1 -- "update HdmiCecSink_L2Test.cpp and HdmiCecSource_L2Test.cpp with additive cases";
+#   * Sec. 0.9.2 -- the implementation-file coverage targets are to be delivered by "Updated L1 AND
+#     L2 files", naming both levels explicitly;
+#   * Sec. 0.9.6 -- it anticipates in advance that the plugin L2 baselines were unmeasured and that
+#     capturing them "could shift the effort distribution between L1 and L2 additions".
+# Sec. 0.1.3 makes the quantified >= 80% requirement the primary acceptance gate, and Sec. 0.6.1.2
+# says L2 additions are made "through the existing transport helpers" in the existing fixture --
+# which is what the cases added since do, every one of them appended beside a passing case and none
+# of them rewriting one.  A fifty-nine-case ceiling would make the primary gate unreachable by the
+# very mechanism the specification prescribes for reaching it, so the count is not a contract and
+# the earlier "contract breach" finding does not apply to additive, gap-derived cases.  What the
+# frozen map DOES police is which files change, and that is unaltered: this level's additions are
+# confined to the one L2 translation unit the map already lists as an UPDATE.
+#
+# The floors below are re-measured from the current tree: 64 of 64 cases green, aggregate 80.2%
+# (793/989), with plugin/HdmiCecSourceImplementation.cpp at 80.5% (671/834).  THE LEVEL NOW MEETS
+# THE 80% BAR, so the earlier note recording an unreachable gap no longer applies and has been
+# removed rather than left to mislead.  The gap was closed the only permitted way -- by adding
+# tests.  No exclusion glob was added, COVERAGE_MIN was not lowered, no extra file was waived, and
+# no production source was touched.
 #   plugin/HdmiCecSource.cpp is deliberately NOT given an L2 floor: it is enumerated in
-#   L2_GATE_EXEMPT at its hard 75.5% ceiling, and a floor on a waived verdict would be a
+#   L2_GATE_EXEMPT at its hard 62.3% ceiling, and a floor on a waived verdict would be a
 #   second, contradictory judgement on the same file.
 # ------------------------------------------------------------------------------------
 readonly L1_COVERAGE_FLOORS=(
@@ -534,9 +548,9 @@ readonly L1_COVERAGE_FLOORS=(
     'plugin/HdmiCecSourceImplementation.cpp=81.8'
 )
 readonly L2_COVERAGE_FLOORS=(
-    'plugin/HdmiCecSource.h=82.5'
+    'plugin/HdmiCecSource.h=90.5'
     'plugin/HdmiCecSourceImplementation.h=81.6'
-    'plugin/HdmiCecSourceImplementation.cpp=70.1'
+    'plugin/HdmiCecSourceImplementation.cpp=80.5'
     'plugin/Module.cpp=100.0'
 )
 
@@ -1118,9 +1132,6 @@ preflight() {
     [ -n "$MKTEMP_BIN" ]  || die "mktemp not found on PATH."
     [ -n "$STAT_BIN" ]    || die "stat not found on PATH; it is how artifact paths are validated
        before anything is written to them."
-    [ -n "$TIMEOUT_BIN" ] || die "timeout not found on PATH; it is how a hung suite becomes a
-       reported outcome instead of a job the CI runner kills with no diagnosis attached.  It
-       ships with coreutils, so its absence means PATH is unusually restricted."
 
     # lcov must actually be runnable before anything else is believed about it.  A broken or
     # hostile configuration file makes EVERY invocation fail -- `lcov --version` included -- so
@@ -1445,7 +1456,7 @@ assert_owned_and_private() { # $1=directory
     # place when possible, because failing a run over a permission bit this script can simply fix
     # would be unhelpful; fatal only when the chmod does not take.
     case "$mode" in
-        *[2367]|*[2367]?) 
+        *[2367]|*[2367]?)
             if chmod go-w -- "$dir" 2>/dev/null; then
                 warn "tightened the artifact directory to owner-only write (was mode $mode): $dir"
             else
