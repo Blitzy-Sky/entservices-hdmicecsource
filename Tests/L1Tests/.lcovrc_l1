@@ -54,7 +54,8 @@ genhtml_num_spaces = 8
 
 # Highlight lines with converted-only data if non-zero (same as --highlight
 # option of genhtml)
-genhtml_highlight = 0
+# (genhtml_highlight was set here; lcov 2.x deprecates AND ignores it, so the
+#  setting has been removed rather than carried as a no-op that emits a warning.)
 
 # Include color legend in HTML output if non-zero (same as --legend option of
 # genhtml)
@@ -144,7 +145,7 @@ geninfo_auto_base = 1
 geninfo_intermediate = auto
 
 # Specify if exception branches should be excluded from branch coverage.
-geninfo_no_exception_branch = 0
+no_exception_branch = 0
 
 # Directory containing gcov kernel files
 # lcov_gcov_dir = /proc/gcov
@@ -175,7 +176,7 @@ lcov_list_width = 80
 lcov_list_truncate_max = 20
 
 # Specify if function coverage data should be collected and processed.
-lcov_function_coverage = 1
+function_coverage = 1
 
 # Specify if branch coverage data should be collected and processed.
 #
@@ -214,15 +215,26 @@ lcov_function_coverage = 1
 # is likewise never touched - which is why `--config-file` (see above) is what puts THIS file's
 # settings in effect rather than any home-directory shuffling.  An unset HOME is not an error.
 #
+# WHICH SPELLING OF THE KEYS THIS FILE USES, AND WHY
+# --------------------------------------------------
+# The CURRENT lcov 2.x names: `branch_coverage`, `function_coverage` and `no_exception_branch`.
+# The legacy `lcov_branch_coverage` / `lcov_function_coverage` / `geninfo_no_exception_branch`
+# spellings still parse, but they are DEPRECATED in lcov 2.x, which means two things worth
+# avoiding: every invocation emits a deprecation warning that the runners can only suppress by
+# passing `--ignore-errors ...,deprecated`, and a spelling lcov has announced it will stop
+# reading is a setting that can one day stop enabling branch data SILENTLY.  An earlier revision
+# of this file kept the legacy spellings so that all copies in the workspace stayed key-for-key
+# aligned; that rationale no longer holds, because the two in-scope sibling copies
+# (hdmicec/tests/L1Tests/.lcovrc_l1 and entservices-hdmicecsink/Tests/L1Tests/.lcovrc_l1) use the
+# current names, so alignment now REQUIRES the current names here too.
+#
 # WHY THE RUNNER ALSO PASSES --rc branch_coverage=1
 # -------------------------------------------------
-# Not redundancy.  The `lcov_branch_coverage` spelling used below is DEPRECATED in lcov 2.x
-# (the modern key is `branch_coverage`) and defaults to 0, so this file alone could one day
-# stop enabling branch data silently.  A command-line `--rc branch_coverage=1` outranks
-# ~/.lcovrc, /etc/lcovrc and --config-file alike and is therefore the guarantee; this file
-# supplies the settings the repository has chosen.  The legacy spelling is kept so that this
-# file stays key-for-key aligned with the other copies in the workspace; when the workspace
-# migrates, all copies should move together.
+# Not redundancy.  A command-line `--rc branch_coverage=1` outranks ~/.lcovrc, /etc/lcovrc and
+# --config-file alike, so it is the guarantee that branch data is collected even if this file is
+# somehow not the configuration in force -- which is exactly the CI case described above, where
+# the test framework's own copy is what gets read.  This file supplies the settings the
+# repository has chosen; the flag makes the one setting the coverage work depends on unmissable.
 #
 # Reproducing the runner's steps by hand:
 #     lcov --config-file Tests/L1Tests/.lcovrc_l1 --rc branch_coverage=1 \
@@ -231,4 +243,4 @@ lcov_function_coverage = 1
 # with the exclusion globs taken verbatim from the workflow, and apply the bar as
 # `lcov --summary <trace> --fail-under-lines 80` (lcov 2.0-1 rejects --fail-under-lines
 # without an operation).
-lcov_branch_coverage = 1
+branch_coverage = 1

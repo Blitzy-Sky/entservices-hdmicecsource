@@ -3503,6 +3503,7 @@ TEST_F(HdmiCecSource_L2Test, InjectActiveSourceFrameAndVerifyEvent)
     // Wait for OnActiveSourceStatusUpdated event
     uint32_t signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_ACTIVE_SOURCE_STATUS_UPDATED);
     EXPECT_TRUE(signalled & ON_ACTIVE_SOURCE_STATUS_UPDATED);
+    //EXPECT_TRUE(m_notificationHandler.GetActiveSourceStatus());
     TEST_LOG("ActiveSource event verified with status=true");
 
     m_cecSourcePlugin->Unregister(&m_notificationHandler);
@@ -3552,6 +3553,7 @@ TEST_F(HdmiCecSource_L2Test, InjectDeviceVendorIDFrameAndVerifyEvent)
     
     // Wait for device to be added
     uint32_t signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_DEVICE_ADDED);
+    //EXPECT_TRUE(signalled & ON_DEVICE_ADDED);
     m_notificationHandler.ResetEvent();
 
     // Now inject DeviceVendorID frame (Opcode 0x87)
@@ -3618,6 +3620,7 @@ TEST_F(HdmiCecSource_L2Test, InjectSetOSDNameFrameAndVerifyEvent)
     
     // Wait for device to be added
     uint32_t signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_DEVICE_ADDED);
+    //EXPECT_TRUE(signalled & ON_DEVICE_ADDED);
     m_notificationHandler.ResetEvent();
 
     // Now inject SetOSDName frame (Opcode 0x47)
@@ -3781,6 +3784,8 @@ TEST_F(HdmiCecSource_L2Test, InjectCECVersionFrameAndVerifyDeviceAdded)
     // Wait for OnDeviceAdded event
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     uint32_t signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_DEVICE_ADDED);
+    //EXPECT_TRUE(signalled & ON_DEVICE_ADDED);
+    //EXPECT_EQ(m_notificationHandler.GetLogicalAddress(), 5);
     TEST_LOG("CECVersion frame processed - device 5 added");
 
     m_cecSourcePlugin->Unregister(&m_notificationHandler);
@@ -4080,6 +4085,7 @@ TEST_F(HdmiCecSource_L2Test, InjectRoutingChangeFrameAndVerifyActiveSource)
     // Wait for OnActiveSourceStatusUpdated event
     uint32_t signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_ACTIVE_SOURCE_STATUS_UPDATED);
     EXPECT_TRUE(signalled & ON_ACTIVE_SOURCE_STATUS_UPDATED);
+    //EXPECT_TRUE(m_notificationHandler.GetActiveSourceStatus());
     TEST_LOG("RoutingChange frame processed - active source status updated to true");
 
     m_cecSourcePlugin->Unregister(&m_notificationHandler);
@@ -4132,6 +4138,7 @@ TEST_F(HdmiCecSource_L2Test, InjectRoutingInformationFrameAndVerifyActiveSource)
     // Wait for OnActiveSourceStatusUpdated event
     uint32_t signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_ACTIVE_SOURCE_STATUS_UPDATED);
     EXPECT_TRUE(signalled & ON_ACTIVE_SOURCE_STATUS_UPDATED);
+    //EXPECT_TRUE(m_notificationHandler.GetActiveSourceStatus());
     TEST_LOG("RoutingInformation frame processed - active source status updated to true");
 
     m_cecSourcePlugin->Unregister(&m_notificationHandler);
@@ -4184,6 +4191,7 @@ TEST_F(HdmiCecSource_L2Test, InjectSetStreamPathFrameAndVerifyActiveSource)
     // Wait for OnActiveSourceStatusUpdated event
     uint32_t signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_ACTIVE_SOURCE_STATUS_UPDATED);
     EXPECT_TRUE(signalled & ON_ACTIVE_SOURCE_STATUS_UPDATED);
+    //EXPECT_TRUE(m_notificationHandler.GetActiveSourceStatus());
     TEST_LOG("SetStreamPath frame processed - active source status updated to true");
 
     m_cecSourcePlugin->Unregister(&m_notificationHandler);
