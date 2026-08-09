@@ -23,6 +23,7 @@
 #include <iostream>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -258,11 +259,25 @@ namespace
         bool m_held;
     };
 
-    static bool readFile(const char* fileName, bool& filePresent, std::string& fileContents, mode_t& fileMode)
+    // fileUid/fileGid are optional out-parameters and, when supplied, are part of the snapshot
+    // in exactly the way fileMode is.  Contents and permissions are not the whole of the state
+    // being borrowed on a host-global path: a file handed back with the right bytes under a
+    // different OWNER has still changed the machine, and on /etc/device.properties that is a
+    // change to who may write it.  They are set to (uid_t)-1 / (gid_t)-1 when nothing was
+    // captured, which is also the value chown() treats as "leave this component alone", so an
+    // uncaptured snapshot can never accidentally re-own a file.
+    static bool readFile(const char* fileName, bool& filePresent, std::string& fileContents, mode_t& fileMode,
+        uid_t* fileUid = nullptr, gid_t* fileGid = nullptr)
     {
         filePresent = false;
         fileContents.clear();
         fileMode = 0;
+        if (fileUid != nullptr) {
+            *fileUid = static_cast<uid_t>(-1);
+        }
+        if (fileGid != nullptr) {
+            *fileGid = static_cast<gid_t>(-1);
+        }
 
         const int fd = ::open(fileName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
         if (fd < 0) {
@@ -295,6 +310,12 @@ namespace
 
         filePresent = true;
         fileMode = fileStat.st_mode;
+        if (fileUid != nullptr) {
+            *fileUid = fileStat.st_uid;
+        }
+        if (fileGid != nullptr) {
+            *fileGid = fileStat.st_gid;
+        }
         char buffer[4096];
         ssize_t bytesRead = 0;
         bool overCap = false;
@@ -316,6 +337,12 @@ namespace
             filePresent = false;
             fileContents.clear();
             fileMode = 0;
+            if (fileUid != nullptr) {
+                *fileUid = static_cast<uid_t>(-1);
+            }
+            if (fileGid != nullptr) {
+                *fileGid = static_cast<gid_t>(-1);
+            }
             return false;
         }
 
@@ -323,6 +350,12 @@ namespace
             printf("File %s failed mid-read: %s\n", fileName, strerror(readErrno));
             fileContents.clear();
             fileMode = 0;
+            if (fileUid != nullptr) {
+                *fileUid = static_cast<uid_t>(-1);
+            }
+            if (fileGid != nullptr) {
+                *fileGid = static_cast<gid_t>(-1);
+            }
             return false;
         }
 
@@ -338,15 +371,28 @@ namespace
     // keeping the widening.  Zero means no snapshot is being restored (this call is
     // provisioning a value for a test to read), and only then are the permissions the path
     // already carries preserved instead.
-    static bool writeFile(const char* fileName, const std::string& fileContents, const mode_t capturedMode = 0)
+    static bool writeFile(const char* fileName, const std::string& fileContents, const mode_t capturedMode = 0,
+        const uid_t capturedUid = static_cast<uid_t>(-1), const gid_t capturedGid = static_cast<gid_t>(-1))
     {
         // Serialised against every other holder of this path's custody lock.  Shared with an
-        // enclosing guard when one is already holding it, so a nested write does not deadlock.
+        // enclosing guard when one is already holding it, so a nested write does not deadlock -
+        // and an enclosing guard is the normal case, because every guard in this file takes the
+        // lock for its WHOLE lifetime rather than for the duration of one write.
+        //
+        // NOT FAIL-OPEN.  This used to print a notice and write anyway, which is the one
+        // behaviour that makes the lock decorative: the point of custody is that "snapshot,
+        // provision, run, restore" cannot interleave with another writer, and a write that
+        // proceeds without it can silently be the one that clobbers - or is clobbered by - the
+        // other party.  Refusing is strictly better: the caller gets false, every caller in this
+        // file propagates that into an assertion or an ADD_FAILURE, and the host is left as it
+        // was rather than half-changed under no exclusion at all.
         PathCustodyLock custody(fileName);
         if (!custody.Held()) {
-            printf("File %s: proceeding WITHOUT the custody lock (it could not be acquired); the "
-                   "write below is still atomic, but it is not serialised against another writer\n",
+            printf("File %s: REFUSING to write - the custody lock could not be acquired within its "
+                   "bound, so this write could not be serialised against another writer of the same "
+                   "path.  Nothing was changed.\n",
                 fileName);
+            return false;
         }
 
         mode_t fileMode = (capturedMode != 0) ? (capturedMode & 07777) : static_cast<mode_t>(0644);
@@ -413,11 +459,60 @@ namespace
             printf("File %s could not be given mode %o: %s\n", fileName, fileMode, strerror(errno));
             written = false;
         }
-        struct stat stagedStat;
-        if (written && ((fstat(fd, &stagedStat) != 0) || ((stagedStat.st_mode & 07777) != (fileMode & 07777)))) {
-            printf("File %s was staged with mode %o instead of %o; refusing to publish it\n",
-                fileName, static_cast<unsigned>(stagedStat.st_mode & 07777), fileMode);
-            written = false;
+
+        // OWNERSHIP GOES BACK WITH THE BYTES, and only when a snapshot supplied one.
+        // (uid_t)-1 / (gid_t)-1 mean "leave this component alone" to fchown itself, so a
+        // provisioning write - which captures nothing - cannot re-own anything.  Attempted only
+        // when the staged file's current owner actually differs from the captured one: a
+        // non-root run legitimately cannot chown, and calling it to set the values it already
+        // has would turn an unprivileged run into a failure for no gain.
+        if (written && ((capturedUid != static_cast<uid_t>(-1)) || (capturedGid != static_cast<gid_t>(-1)))) {
+            struct stat ownerStat;
+            if (fstat(fd, &ownerStat) != 0) {
+                printf("File %s: the staged copy could not be examined to compare its owner: %s\n",
+                    fileName, strerror(errno));
+                written = false;
+            } else {
+                const bool uidDiffers = (capturedUid != static_cast<uid_t>(-1)) && (ownerStat.st_uid != capturedUid);
+                const bool gidDiffers = (capturedGid != static_cast<gid_t>(-1)) && (ownerStat.st_gid != capturedGid);
+                if ((uidDiffers || gidDiffers) && (fchown(fd, capturedUid, capturedGid) != 0)) {
+                    printf("File %s could not be given owner %ld:%ld: %s; refusing to publish it, "
+                           "because publishing would hand the host back a file under a different "
+                           "owner than it had\n",
+                        fileName, static_cast<long>(capturedUid), static_cast<long>(capturedGid),
+                        strerror(errno));
+                    written = false;
+                }
+            }
+        }
+
+        // fstat AFTER the mode and owner have been set, because a filesystem that silently
+        // remaps either would otherwise let the restore claim success while handing the host
+        // back a file wearing the wrong permissions or owner.
+        //
+        // The two conditions are checked SEPARATELY on purpose.  Folding them into one
+        // `(fstat(...) != 0) || (stagedStat.st_mode ... )` left the diagnostic below printing
+        // stagedStat.st_mode on the arm where fstat had FAILED and the structure was therefore
+        // never initialised - reading an indeterminate value to describe a failure.  Only
+        // initialised stat data is inspected now.
+        if (written) {
+            struct stat stagedStat;
+            if (fstat(fd, &stagedStat) != 0) {
+                printf("File %s: the staged copy could not be examined before publication: %s\n",
+                    fileName, strerror(errno));
+                written = false;
+            } else if ((stagedStat.st_mode & 07777) != (fileMode & 07777)) {
+                printf("File %s was staged with mode %o instead of %o; refusing to publish it\n",
+                    fileName, static_cast<unsigned>(stagedStat.st_mode & 07777), fileMode);
+                written = false;
+            } else if (((capturedUid != static_cast<uid_t>(-1)) && (stagedStat.st_uid != capturedUid))
+                || ((capturedGid != static_cast<gid_t>(-1)) && (stagedStat.st_gid != capturedGid))) {
+                printf("File %s was staged with owner %ld:%ld instead of %ld:%ld; refusing to "
+                       "publish it\n",
+                    fileName, static_cast<long>(stagedStat.st_uid), static_cast<long>(stagedStat.st_gid),
+                    static_cast<long>(capturedUid), static_cast<long>(capturedGid));
+                written = false;
+            }
         }
         if ((::close(fd) != 0) && written) {
             printf("File %s failed on close: %s\n", fileName, strerror(errno));
@@ -501,13 +596,25 @@ namespace
     //
     // capturedMode comes from the same readFile() call, so the file goes back with the
     // permissions it had rather than the permissions it happens to be wearing now.
-    static bool restoreFile(const char* fileName, const bool wasPresent, const std::string& fileContents, const mode_t capturedMode)
+    static bool restoreFile(const char* fileName, const bool wasPresent, const std::string& fileContents, const mode_t capturedMode,
+        const uid_t capturedUid = static_cast<uid_t>(-1), const gid_t capturedGid = static_cast<gid_t>(-1))
     {
         // Held across the whole restore, so the "is it still what we left?" report below and the
-        // write that follows it cannot be separated by another holder of the same lock.
+        // write that follows it cannot be separated by another holder of the same lock.  Shared
+        // with the enclosing guard's lifetime lock when one is held, so this is normally a
+        // refcount increment rather than a fresh acquisition.
+        //
+        // NOT FAIL-OPEN, for the same reason as writeFile: a restore performed without exclusion
+        // is exactly the operation that can put a stale snapshot over somebody else's update.
+        // Refusing returns false, which every caller in this file turns into a reported failure,
+        // and the destructor's un-latched m_restored then retries.
         PathCustodyLock custody(fileName);
         if (!custody.Held()) {
-            printf("File %s: restoring WITHOUT the custody lock (it could not be acquired)\n", fileName);
+            printf("File %s: REFUSING to restore - the custody lock could not be acquired within "
+                   "its bound, so the restore could not be serialised against another writer of "
+                   "the same path.  Nothing was changed.\n",
+                fileName);
+            return false;
         }
 
         // A restore puts a SNAPSHOT back.  If the path no longer holds what this fixture last
@@ -531,7 +638,7 @@ namespace
         }
 
         if (wasPresent) {
-            return writeFile(fileName, fileContents, capturedMode);
+            return writeFile(fileName, fileContents, capturedMode, capturedUid, capturedGid);
         }
 
         // The file did not exist before this fixture ran, so it has to be gone again.
@@ -587,15 +694,33 @@ namespace
     // Snapshot both process-global files and disable CEC worker threads so lifecycle callbacks remain deterministic.
     class ScopedLifecycleFiles {
     public:
+        // BOTH CUSTODY LOCKS ARE DECLARED FIRST, so they are acquired before the snapshot is
+        // taken and released only after the restore in the destructor has run.  Custody that
+        // spans "snapshot, provision, run, restore" as ONE window is the whole point: taken per
+        // write instead, another writer can legitimately slip in between the snapshot and the
+        // restore, and the restore then puts stale bytes over its update.
+        //
+        // A lock that could not be acquired is a REFUSAL to mutate, not a warning.  Nothing is
+        // provisioned in that case, IsValid() reports false, and the destructor restores nothing
+        // because nothing was captured - so the host is left exactly as it was found rather than
+        // half-changed with no exclusion behind it.
         ScopedLifecycleFiles()
-            : m_devicePropertiesWasPresent(false)
+            : m_devicePropertiesCustody("/etc/device.properties")
+            , m_cecSettingsCustody(CEC_SETTING_ENABLED_FILE)
+            , m_devicePropertiesWasPresent(false)
             , m_devicePropertiesContents()
             , m_devicePropertiesMode(0)
-            , m_devicePropertiesSnapshotCaptured(readFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents, m_devicePropertiesMode))
+            , m_devicePropertiesUid(static_cast<uid_t>(-1))
+            , m_devicePropertiesGid(static_cast<gid_t>(-1))
+            , m_devicePropertiesSnapshotCaptured(m_devicePropertiesCustody.Held() && m_cecSettingsCustody.Held()
+                  && readFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents, m_devicePropertiesMode, &m_devicePropertiesUid, &m_devicePropertiesGid))
             , m_cecSettingsWasPresent(false)
             , m_cecSettingsContents()
             , m_cecSettingsMode(0)
-            , m_cecSettingsSnapshotCaptured(readFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents, m_cecSettingsMode))
+            , m_cecSettingsUid(static_cast<uid_t>(-1))
+            , m_cecSettingsGid(static_cast<gid_t>(-1))
+            , m_cecSettingsSnapshotCaptured(m_devicePropertiesCustody.Held() && m_cecSettingsCustody.Held()
+                  && readFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents, m_cecSettingsMode, &m_cecSettingsUid, &m_cecSettingsGid))
             , m_cecSettingsDirectoryCreated(false)
             , m_cecSettingsDirectoryPath()
             , m_devicePropertiesProvisioned(false)
@@ -603,6 +728,13 @@ namespace
             , m_restored(false)
             , m_restoreSucceeded(false)
         {
+            if (!m_devicePropertiesCustody.Held() || !m_cecSettingsCustody.Held()) {
+                printf("ScopedLifecycleFiles: custody of /etc/device.properties and/or %s could not "
+                       "be acquired, so NOTHING was snapshotted or provisioned and the host is "
+                       "untouched.  IsValid() reports false.\n",
+                    CEC_SETTING_ENABLED_FILE);
+                return;
+            }
             if (m_devicePropertiesSnapshotCaptured && m_cecSettingsSnapshotCaptured
                 && ensureParentDirectory(CEC_SETTING_ENABLED_FILE, m_cecSettingsDirectoryCreated, m_cecSettingsDirectoryPath)) {
                 m_devicePropertiesProvisioned = writeFile("/etc/device.properties", "RDK_PROFILE=STB\n");
@@ -623,10 +755,10 @@ namespace
             if (!m_restored) {
                 bool restored = true;
                 if (m_cecSettingsSnapshotCaptured) {
-                    restored = restoreFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents, m_cecSettingsMode) && restored;
+                    restored = restoreFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents, m_cecSettingsMode, m_cecSettingsUid, m_cecSettingsGid) && restored;
                 }
                 if (m_devicePropertiesSnapshotCaptured) {
-                    restored = restoreFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents, m_devicePropertiesMode) && restored;
+                    restored = restoreFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents, m_devicePropertiesMode, m_devicePropertiesUid, m_devicePropertiesGid) && restored;
                 }
                 restored = removeCreatedDirectory(m_cecSettingsDirectoryCreated, m_cecSettingsDirectoryPath) && restored;
 
@@ -660,8 +792,8 @@ namespace
             }
 
             if (!m_restored) {
-                const bool cecSettingsRestored = restoreFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents, m_cecSettingsMode);
-                const bool devicePropertiesRestored = restoreFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents, m_devicePropertiesMode);
+                const bool cecSettingsRestored = restoreFile(CEC_SETTING_ENABLED_FILE, m_cecSettingsWasPresent, m_cecSettingsContents, m_cecSettingsMode, m_cecSettingsUid, m_cecSettingsGid);
+                const bool devicePropertiesRestored = restoreFile("/etc/device.properties", m_devicePropertiesWasPresent, m_devicePropertiesContents, m_devicePropertiesMode, m_devicePropertiesUid, m_devicePropertiesGid);
                 const bool directoryRemoved = removeCreatedDirectory(m_cecSettingsDirectoryCreated, m_cecSettingsDirectoryPath);
                 m_restoreSucceeded = cecSettingsRestored && devicePropertiesRestored && directoryRemoved;
 
@@ -690,16 +822,25 @@ namespace
         }
 
     private:
+        // FIRST TWO MEMBERS, so they are constructed before every snapshot below and destroyed
+        // after the destructor body's restore has finished.  Declaration order IS the lifetime
+        // here, so these must stay at the top.
+        PathCustodyLock m_devicePropertiesCustody;
+        PathCustodyLock m_cecSettingsCustody;
         bool m_devicePropertiesWasPresent;
         std::string m_devicePropertiesContents;
         // Declared before the matching ...SnapshotCaptured member on purpose: that member is
         // initialised by the readFile() call which fills this one, and members initialise in
-        // declaration order.
+        // declaration order.  The same applies to the uid/gid pair.
         mode_t m_devicePropertiesMode;
+        uid_t m_devicePropertiesUid;
+        gid_t m_devicePropertiesGid;
         bool m_devicePropertiesSnapshotCaptured;
         bool m_cecSettingsWasPresent;
         std::string m_cecSettingsContents;
         mode_t m_cecSettingsMode;
+        uid_t m_cecSettingsUid;
+        gid_t m_cecSettingsGid;
         bool m_cecSettingsSnapshotCaptured;
         bool m_cecSettingsDirectoryCreated;
         std::string m_cecSettingsDirectoryPath;
@@ -749,15 +890,31 @@ namespace
     // is the exact window needed.  No existing test body is modified by this.
     class ScopedCecSettingsFile {
     public:
+        // m_custody IS THE FIRST MEMBER, so the lock is taken before the snapshot below and
+        // released only after the destructor's restore.  One window over "snapshot, clear, run,
+        // restore" rather than one per write; see writeFile() for why per-write custody is not
+        // custody at all.  When it cannot be acquired nothing is snapshotted, nothing is
+        // cleared, IsPrepared() reports false, and the host is untouched.
         ScopedCecSettingsFile()
-            : m_wasPresent(false)
+            : m_custody(CEC_SETTING_ENABLED_FILE)
+            , m_wasPresent(false)
             , m_contents()
             , m_mode(0)
-            , m_captured(readFile(CEC_SETTING_ENABLED_FILE, m_wasPresent, m_contents, m_mode))
+            , m_uid(static_cast<uid_t>(-1))
+            , m_gid(static_cast<gid_t>(-1))
+            , m_captured(m_custody.Held()
+                  && readFile(CEC_SETTING_ENABLED_FILE, m_wasPresent, m_contents, m_mode, &m_uid, &m_gid))
             , m_directoryCreated(false)
             , m_directoryPath()
             , m_prepared(false)
         {
+            if (!m_custody.Held()) {
+                printf("ScopedCecSettingsFile: custody of %s could not be acquired, so it was "
+                       "neither snapshotted nor cleared and the host is untouched.  IsPrepared() "
+                       "reports false.\n",
+                    CEC_SETTING_ENABLED_FILE);
+                return;
+            }
             if (m_captured && ensureParentDirectory(CEC_SETTING_ENABLED_FILE, m_directoryCreated, m_directoryPath)) {
                 // Absent is the state under test: it is what makes loadSettings() take its
                 // create-with-defaults arm, deterministically, for every test.
@@ -777,7 +934,7 @@ namespace
             // by 15 lines between runs, and a suite that cannot hand the host back must not
             // report success.  GoogleTest attributes a failure raised in a fixture destructor to
             // the test that was running.
-            if (m_captured && !restoreFile(CEC_SETTING_ENABLED_FILE, m_wasPresent, m_contents, m_mode)) {
+            if (m_captured && !restoreFile(CEC_SETTING_ENABLED_FILE, m_wasPresent, m_contents, m_mode, m_uid, m_gid)) {
                 ADD_FAILURE() << "ScopedCecSettingsFile: " << CEC_SETTING_ENABLED_FILE
                               << " could not be restored to the state this fixture found; see the "
                                  "diagnostics above.  The host is left modified and the next test "
@@ -796,11 +953,16 @@ namespace
         bool WasPresentOnTheHost() const { return m_wasPresent; }
 
     private:
+        // FIRST MEMBER: declaration order is the lifetime of the custody window.
+        PathCustodyLock m_custody;
         bool m_wasPresent;
         std::string m_contents;
         // Declared before m_captured on purpose: m_captured is initialised by the readFile()
-        // call that fills this one, and members initialise in declaration order.
+        // call that fills this one, and members initialise in declaration order.  The uid/gid
+        // pair is part of the same snapshot and follows the same rule.
         mode_t m_mode;
+        uid_t m_uid;
+        gid_t m_gid;
         bool m_captured;
         bool m_directoryCreated;
         std::string m_directoryPath;
@@ -1375,17 +1537,37 @@ protected:
     // leave a host-global path permanently more permissive than this fixture found it, which
     // is a change to the machine even though every assertion passed.
     mode_t m_devicePropertiesMode;
+    // The owner the host's own /etc/device.properties carried, captured and restored for the
+    // same reason as the mode: bytes under a different owner are not the state that was borrowed,
+    // and on this path the owner decides who may write it.
+    uid_t m_devicePropertiesUid;
+    gid_t m_devicePropertiesGid;
     // Whether SetUp actually captured a snapshot. TearDown runs even when SetUp aborts on a
     // fatal assertion, and restoring from an uncaptured snapshot means "the file was absent",
     // which would delete a real /etc/device.properties this fixture never read.
     bool m_devicePropertiesSnapshotCaptured;
+    // CUSTODY HELD FOR THE WHOLE TEST, not for the duration of each write.
+    //
+    // This fixture's window is SetUp -> test body -> TearDown, and the test bodies in it delete
+    // and recreate /etc/device.properties themselves, so the snapshot and the restore are
+    // separated by arbitrary test code.  A lock taken per write would leave that gap unguarded
+    // and the TearDown restore could then put SetUp's snapshot over an update another writer
+    // made in between.  Held here from before the snapshot until after the restore, it is one
+    // window; the lock is reference-counted per path inside the process, so the nested
+    // acquisitions inside writeFile()/restoreFile() are increments rather than deadlocks.
+    // unique_ptr because SetUp and TearDown are separate functions and GoogleTest guarantees
+    // TearDown runs even when a test aborts on a fatal failure or is skipped.
+    std::unique_ptr<PathCustodyLock> m_devicePropertiesCustody;
 
     HdmiCecSourceSettingsTest()
         : HdmiCecSourceTest()
         , m_devicePropertiesPresent(false)
         , m_devicePropertiesContents()
         , m_devicePropertiesMode(0)
+        , m_devicePropertiesUid(static_cast<uid_t>(-1))
+        , m_devicePropertiesGid(static_cast<gid_t>(-1))
         , m_devicePropertiesSnapshotCaptured(false)
+        , m_devicePropertiesCustody()
     {
         
     }
@@ -1396,11 +1578,19 @@ protected:
 
     void SetUp() override
     {
-        m_devicePropertiesSnapshotCaptured = readFile("/etc/device.properties", m_devicePropertiesPresent, m_devicePropertiesContents, m_devicePropertiesMode);
+        // Custody FIRST, and abort before touching anything if it is not granted: a fixture that
+        // cannot serialise itself against another writer of this host-global path must not
+        // provision it at all, because its TearDown restore would then be unguarded too.
+        m_devicePropertiesCustody.reset(new PathCustodyLock("/etc/device.properties"));
+        ASSERT_TRUE(m_devicePropertiesCustody->Held())
+            << "Could not take custody of /etc/device.properties within its bound, so this test "
+               "cannot safely provision it; nothing has been changed.";
+
+        m_devicePropertiesSnapshotCaptured = readFile("/etc/device.properties", m_devicePropertiesPresent, m_devicePropertiesContents, m_devicePropertiesMode, &m_devicePropertiesUid, &m_devicePropertiesGid);
         ASSERT_TRUE(m_devicePropertiesSnapshotCaptured) << "Could not snapshot /etc/device.properties, so this test cannot safely provision it.";
         // Provisioned without a mode, so the profile this fixture needs is written under
-        // whatever permissions the path already carries; the captured mode is kept for the
-        // restore, which is the only place it has to be reasserted.
+        // whatever permissions the path already carries; the captured mode and owner are kept
+        // for the restore, which is the only place they have to be reasserted.
         ASSERT_TRUE(writeFile("/etc/device.properties", "RDK_PROFILE=STB\n"));
     }
 
@@ -1408,14 +1598,18 @@ protected:
     {
         // Restore only what was captured. Without this guard a failed capture would leave
         // m_devicePropertiesPresent false and the restore would remove the host's own file.
-        if (!m_devicePropertiesSnapshotCaptured) {
-            return;
+        if (m_devicePropertiesSnapshotCaptured) {
+            // The captured mode and owner go back with the captured bytes: a test body in this
+            // fixture may have deleted and recreated the file at the ofstream default in
+            // between, so the mode and owner on the path right now are this suite's, not the
+            // host's.
+            EXPECT_TRUE(restoreFile("/etc/device.properties", m_devicePropertiesPresent, m_devicePropertiesContents, m_devicePropertiesMode, m_devicePropertiesUid, m_devicePropertiesGid));
         }
 
-        // The captured mode goes back with the captured bytes: a test body in this fixture
-        // may have deleted and recreated the file at the ofstream default in between, so the
-        // mode on the path right now is this suite's, not the host's.
-        EXPECT_TRUE(restoreFile("/etc/device.properties", m_devicePropertiesPresent, m_devicePropertiesContents, m_devicePropertiesMode));
+        // Released only after the restore, so the custody window closes on the same state it
+        // opened on.  Unconditional: the lock has to be dropped even when nothing was captured,
+        // or the next test in this fixture would find its own acquisition already counted.
+        m_devicePropertiesCustody.reset();
     }
 };
 
@@ -1858,24 +2052,17 @@ TEST_F(HdmiCecSourceInitializedTest, sendKeyPressEvent20)
 
 }
 
-// REMEDIATED - was DISABLED_NotSupportedPlugin, disabled with the note "Failing to remove file
-// when triggered on github. There might be some kind of permission issue."
+// This test drives /etc/device.properties, a process-global path shared with every other fixture
+// in this suite and with the host itself, so it owns that state explicitly rather than leaving it
+// altered. ScopedLifecycleFiles snapshots both process-global lifecycle files on entry and puts
+// them back on exit; its destructor restores even if the test aborts on a fatal assertion, so no
+// path through the body can hand the next fixture an absent /etc/device.properties - which the
+// plugin refuses to initialise without. The file helpers it calls are symlink-guarded, so a
+// symlink planted at one of these fixed, world-traversable paths is refused rather than written
+// through.
 //
-// Two things were wrong with it. The disablement reason is a symptom: the test drove
-// /etc/device.properties directly, so whether it could remove that file depended on the host it
-// ran on. And whatever the outcome, it ended by deleting the file outright, handing an absent
-// /etc/device.properties to whatever fixture ran next - the same class of process-global state
-// leak that makes sibling fixtures in this suite fail depending on execution order.
-//
-// It is enabled here by giving it the preconditions it always needed: ScopedLifecycleFiles
-// snapshots both process-global lifecycle files on entry and puts them back on exit (its
-// destructor restores even if the test aborts on a fatal assertion), and the file helpers it
-// calls are now symlink-guarded. The `system("ls -lh /etc/")` diagnostics have been dropped -
-// they existed only to investigate the CI permission problem this remediation removes, and they
-// route through the wrapped `system` symbol, which is mock territory rather than a real listing.
-//
-// What the test asserts is unchanged: no profile file and a TV profile must both be rejected with
-// "Not supported", and only an STB profile may initialise successfully.
+// What it asserts: no profile file and a TV profile must both be rejected with "Not supported",
+// and only an STB profile may initialise successfully.
 TEST_F(HdmiCecSourceTest, NotSupportedPlugin)
 {
     ScopedLifecycleFiles lifecycleFiles;
@@ -1899,14 +2086,12 @@ TEST_F(HdmiCecSourceTest, NotSupportedPlugin)
 // loadSettings(): BOTH arms, pinned explicitly rather than left to whatever the host's CEC
 // settings file happened to contain.
 //
-// These are new adjacent cases, not edits to anything above.  They exist because the arm
-// that ran used to be decided by residue: the settings file is a host-global path
-// (/opt/persistent/ds/cecData_2.json) that this suite and the sibling sink suite both write,
-// and with it left behind by an earlier run the create-with-defaults arm
-// (HdmiCecSourceImplementation.cpp:868-888) never executed - 15 lines of coverage appearing
-// and disappearing between identical green runs.  ScopedCecSettingsFile now owns that path
-// for every fixture in this suite and hands each test the absent state; these two tests
-// assert what each arm actually does, so the behaviour is pinned as well as the state.
+// The settings file is a host-global path (/opt/persistent/ds/cecData_2.json) that this suite
+// and the sibling sink suite both write, so without custody of it the arm a test takes is
+// decided by whatever residue the previous run left: with the file present, the
+// create-with-defaults arm never executes at all.  ScopedCecSettingsFile owns that path for
+// every fixture in this suite and hands each test the absent state; these two tests then assert
+// what each arm does, so the behaviour is pinned as well as the state.
 //
 // They live in HdmiCecSourceTest rather than a derived fixture because the file has to be
 // arranged BEFORE the plugin initialises, and the derived fixtures initialise it in their
@@ -1916,23 +2101,18 @@ TEST_F(HdmiCecSourceTest, NotSupportedPlugin)
 // ----------------------------------------------------------------------
 // Both tests wind CEC down with setEnabled(false) and only then call Deinitialize, which is
 // the same order HdmiCecSourceInitializedTest's destructor uses.  That is not a stylistic
-// choice; the alternative crashes the process, and it does so inside production code:
-//
-//   Thread 1 (poll)  HdmiCecSourceImplementation::addDevice(int)   <- SIGSEGV
-//   Thread 6 (main)  ~HdmiCecSourceImplementation -> setEnabledInternal -> CECDisable
-//                    -> std::thread::join()
+// choice; the alternative races against production code and crashes the process.
 //
 // addDevice() (HdmiCecSourceImplementation.cpp:499-521) walks _hdmiCecSourceNotifications
 // WITHOUT taking _adminLock, while Unregister() (:480-495) takes _adminLock, calls Release()
 // on the notification and erase()s it from that same list.  Deinitialize unregisters, so a
 // poll thread that reaches addDevice at that moment iterates a list being erased underneath
-// it and dispatches through a pointer that has already been released.  Observed as a
-// reproducible SIGSEGV (core inspected, stack above) when a test leaves CEC enabled long
-// enough for the poll thread to discover a device before Deinitialize runs; the pre-existing
-// tests avoid it because every fixture disables CEC first, which JOINS the poll and update
-// threads before anything is unregistered.
+// it and dispatches through a pointer that has already been released - a SIGSEGV in
+// addDevice() on the poll thread while the main thread is inside ~HdmiCecSourceImplementation.
+// Disabling CEC first JOINS the poll and update threads before anything is unregistered, which
+// is why every fixture in this suite does so and why these two test bodies must as well.
 //
-// This is a production defect and Directive 6 puts production source out of scope, so it is
+// This is a production defect, and production source is out of scope for this suite, so it is
 // recorded here and in Tests/README.md rather than fixed.  THE REQUIRED PRODUCTION CHANGE:
 // take _adminLock around the notification-list traversal in addDevice() and removeDevice()
 // (and dispatch on a copy taken under the lock), the way the rest of that class already does.

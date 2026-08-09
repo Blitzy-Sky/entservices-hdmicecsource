@@ -101,12 +101,11 @@
 #       CMakeLists.txt, the workflows, /etc/lcovrc, entservices-testframework, or anything
 #       under plugin/.  It is not side-effect free, and its three side effects are stated
 #       here rather than buried:
-#         (a) $HOME is NOT one of them.  CI plants a branch-disabled ~/.lcovrc, and rather
-#             than moving that file aside and back -- which would overwrite a copy that
-#             reappeared mid-run, and let one that reappeared apply until the restore --
-#             lcov and genhtml are given a private, empty, mode-0700 HOME created with
-#             mktemp -d.  The caller's $HOME is never read, written, moved or deleted, and
-#             there is nothing to restore afterwards.  An unset HOME is not a special case.
+#         (a) $HOME is NOT one of them.  CI plants a branch-disabled ~/.lcovrc, so lcov and
+#             genhtml are given a private, empty, mode-0700 HOME created with mktemp -d and
+#             removed by the cleanup trap.  The caller's $HOME is never read, written, moved
+#             or deleted, so there is nothing to restore and nothing of the caller's to lose,
+#             including when the run is killed outright.  An unset HOME is not a special case.
 #         (b) the level's *.gcda counters are zeroed before the suite runs, so the figures
 #             describe THIS run and cannot silently accumulate an earlier one.
 #         (c) artifacts are written under $ARTIFACT_ROOT, which by default is MINTED per run
@@ -153,11 +152,19 @@
 #      at or above the bar.  This is the only status that means "measured and passing".
 #   1  a suite failed, a gate failed, or a precondition was not met.  Nothing is swallowed:
 #      lcov's own non-zero exit is what fails the run.
-#   3  ADVISORY: coverage is at or above the bar, but this invocation did not establish the
-#      evidence for it -- currently only when SKIP_LIBRARY_PROVENANCE_CHECK=1 leaves it
-#      unproven that the installed test library belongs to this plugin rather than to the
-#      sink.  Every artifact is still produced and every number is real, but unattributable.
-#      Do not treat 3 as a pass.
+#   3  ADVISORY: coverage is at or above the bar, but this invocation cannot certify it.  Every
+#      artifact is still produced and every number printed is really measured; what is missing
+#      is the standing to call it an acceptance.  The reasons, each printed with the verdict:
+#        * COVERAGE_MIN was not 80.  Directive 4 fixes the bar at 80% per target, so any other
+#          value gates against a threshold this project did not set -- and COVERAGE_MIN=0 would
+#          pass every conceivable tree.
+#        * a must-not-regress floor was breached.  The >= bar was met, but a file lost coverage
+#          it already had, which specification section 0.9.4 forbids accepting silently.
+#        * SKIP_LIBRARY_PROVENANCE_CHECK=1 left it unproven that the installed test library
+#          belongs to this plugin rather than to the sink, so the figures may describe the other
+#          plugin while naming this one.
+#      Do not treat 3 as a pass.  An override may suppress a CHECK; it may not manufacture an
+#      acceptance, so none of the above can reach exit 0.
 # =====================================================================================
 
 set -euo pipefail
@@ -191,10 +198,12 @@ VALGRIND_BIN="$(resolve_tool valgrind)"
 # stat is how the ancestry of every artifact path is checked (owner, mode, type) before a byte
 # is written to it.  It is coreutils, like find and mktemp above.
 STAT_BIN="$(resolve_tool stat)"
-# `timeout` bounds every suite and every rebuild hook this script starts.  It is resolved here with
-# the rest of the tooling because run_suite() and run_level_rebuild_hook() reference it directly and
-# this script runs under `set -u`: unresolved, the name aborts the run with "unbound variable"
-# instead of bounding anything, which is what used to happen on the very first suite invocation.
+# `timeout` bounds every suite and every rebuild hook this script starts, and it is REQUIRED:
+# run_suite() and run_level_rebuild_hook() invoke "$TIMEOUT_BIN" unconditionally, so it is what
+# turns a hung suite or a hung rebuild into a named failure rather than a run that never ends.
+# resolve_tool yields the EMPTY STRING when a tool is absent rather than leaving the name unset,
+# so `set -u` does not catch a missing timeout here; check_tooling is what refuses the run, and
+# it must keep checking this one.  Both sibling runners refuse on the same grounds.
 TIMEOUT_BIN="$(resolve_tool timeout)"
 readonly LCOV_BIN GENHTML_BIN GCOV_BIN FIND_BIN MKTEMP_BIN NM_BIN CMAKE_BIN VALGRIND_BIN STAT_BIN TIMEOUT_BIN
 
@@ -258,14 +267,13 @@ LEVEL_REBUILD_CMD="${LEVEL_REBUILD_CMD:-}"
 # attribute a trace to a target, so every artifact goes to
 # $ARTIFACT_ROOT/<repository>/<level>/ while keeping CI's file names recognisable.
 #
-# THE DEFAULT IS OUTSIDE THE CHECKOUT, and it did not used to be: it was
-# "$WS/coverage-artifacts", mirroring CI writing into $GITHUB_WORKSPACE.  That is safe in CI,
-# where the workspace is discarded after every job, and unsafe here, where $WS is a long-lived
-# git checkout: neither this repository nor the superproject has a .gitignore covering
-# coverage_<level>.info, filtered_coverage_<level>.info or coverage_<level>/, so a
-# default-path run left committable build output inside the working tree and `git add -A`
-# would have staged it.  Editing a .gitignore is out of scope here, so the fix is placement,
-# and it matches what the middleware runner already does.  The workspace-root basename keeps
+# THE DEFAULT IS OUTSIDE THE CHECKOUT, and must stay that way.  CI can safely write into
+# $GITHUB_WORKSPACE because that workspace is discarded after every job; $WS here is a
+# long-lived git checkout, and neither this repository nor the superproject has a .gitignore
+# covering coverage_<level>.info, filtered_coverage_<level>.info or coverage_<level>/, so an
+# in-tree default would leave committable build output in the working tree for `git add -A` to
+# stage.  Editing a .gitignore is out of scope here, so placement is the control, and it
+# matches what the middleware runner does.  The workspace-root basename keeps
 # parallel checkouts of this superproject from overwriting each other's evidence without
 # needing any environment variable.  Point ARTIFACT_ROOT back into the tree if you want CI's
 # literal layout; warn_artifact_root_in_tree() will say so, and keeping it out of a commit
@@ -278,12 +286,12 @@ LEVEL_REBUILD_CMD="${LEVEL_REBUILD_CMD:-}"
 # ARTIFACT_ROOT is still honoured and is checked strictly, ancestry included.
 # EMPTY BY DEFAULT, and that is the security-relevant part: with no explicit choice this
 # script mints its artifact root with `mktemp -d` under $TMPDIR, so the name is unpredictable
-# and the directory is created atomically at mode 0700 (see mint_artifact_root).  The fixed
-# default this script used to carry -- ${TMPDIR:-/tmp}/<repo>-coverage/<workspace basename> --
-# is guessable, and anything able to create entries in a world-writable $TMPDIR could
-# pre-create it as a symlink or as a directory of its own and collect, redirect or tamper with
-# every trace, log and HTML report written underneath.  An unpredictable name cannot be
-# pre-created.  A caller who needs a stable location still sets ARTIFACT_ROOT, and that path
+# and the directory is created atomically at mode 0700 (see mint_artifact_root).  Any FIXED
+# default -- ${TMPDIR:-/tmp}/<repo>-coverage/<workspace basename>, say -- would be guessable,
+# and anything able to create entries in a world-writable $TMPDIR could pre-create it as a
+# symlink or as a directory of its own and collect, redirect or tamper with every trace, log
+# and HTML report written underneath.  An unpredictable name cannot be pre-created.  A caller
+# who needs a stable location still sets ARTIFACT_ROOT, and that path
 # is then held to the stricter checks, because a name chosen in advance is guessable by
 # definition.
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-}"
@@ -299,12 +307,22 @@ fi
 # the numbers stand on evidence this run established for itself; non-empty makes the final
 # verdict ADVISORY and the exit status 3.
 #
-# The case this exists for is SKIP_LIBRARY_PROVENANCE_CHECK=1.  Both plugins in this workspace
-# build their test cases into an identically named library, so an unverified library may be
-# the SINK's -- in which case every figure printed describes the other plugin while naming
-# this one.  That used to be a warning followed, if the numbers happened to clear the bar, by
-# "COVERAGE GATE PASSED" and exit 0: a caller, human or CI, could not tell it from a verified
-# run.  An override may suppress a CHECK; it may not manufacture an acceptance.
+# Three conditions record a reason, and they share one shape: each makes the printed figures
+# real but unable to certify anything.
+#
+#   * SKIP_LIBRARY_PROVENANCE_CHECK=1.  Both plugins in this workspace build their test cases
+#     into an identically named library, so an unverified library may be the SINK's -- in which
+#     case every figure printed describes the other plugin while naming this one.
+#   * COVERAGE_MIN is not 80.  Directive 4 fixes the bar; a run against a different threshold
+#     has measured something, but not the requirement.  COVERAGE_MIN=0 would pass anything.
+#   * a must-not-regress floor was breached.  The >= bar was met while a file lost coverage it
+#     already had -- the regression specification section 0.9.4 exists to catch.
+#
+# Each of these used to be a warning followed, if the numbers happened to clear the bar, by
+# "COVERAGE GATE PASSED" and exit 0: a caller, human or CI, could not tell any of them from a
+# clean run, because the exit status -- the only part a CI step reads -- was identical.  An
+# override may suppress a CHECK, and a diagnostic bar may be useful; neither may manufacture an
+# acceptance.
 # ------------------------------------------------------------------------------------
 ADVISORY_REASONS=''
 readonly EXIT_ADVISORY=3
@@ -351,7 +369,10 @@ readonly BASE_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
 # genhtml title, spelled exactly as both workflows spell it (L1-tests.yml:704,
 # L2-tests.yml:786).  Both levels share it, so the level distinction lives entirely in the
 # exclusion globs and the artifact names.
-readonly GENHTML_TITLE="$REPO_NAME coverage"
+GENHTML_TITLE="$REPO_NAME coverage"
+# NOT readonly: write_provenance() appends the superproject short SHA so every page of
+# the HTML report carries the revision it came from.
+PROVENANCE_TXT=''
 
 # `--ignore-errors` for the capture step: exactly the nine values the recipe specifies, and
 # `category` is deliberately ABSENT from every list in this script.
@@ -453,28 +474,39 @@ readonly L2_EXCLUDES=(
 #   would therefore be false, so the waiver is scoped to the level that genuinely cannot
 #   reach it.
 #
-#   plugin/HdmiCecSource.cpp at L2 -- the plugin SHELL has a hard L2 ceiling of 40/53 = 75.5%,
-#   which is below the bar and cannot be raised by any test.  All thirteen remaining lines are
-#   covered by this repository's own L1 suite (that suite measures this file at 53/53 = 100%),
-#   so the file is not under-tested: it is the L2 EXECUTION MODEL that cannot reach these
-#   thirteen lines.  Enumerated, with the evidence for each:
-#     * Information() -- 2 lines.  PluginHost::IPlugin::Information() is declared pure virtual
-#       at Thunder/Source/plugins/IPlugin.h:97 and is called NOWHERE in Thunder R4.4.1; a grep
-#       of Thunder/Source finds only the Controller's own override.  No L2 client can invoke it.
-#     * the Root<> failure arm -- 3 lines.  _service->Root<Exchange::IHdmiCecSource>() is
-#       resolved by a live Thunder host against an installed, loadable implementation library;
-#       there is no L2 seam that makes it return null, and no production change may be used to
-#       create one.  Covered at L1, where the COMLink is a mock.
-#     * the out-of-process teardown block -- 7 lines (RemoteConnection / Terminate / its catch /
-#       Release).  At L2 the implementation runs IN-PROCESS, so _connectionId is 0 and
-#       _service->RemoteConnection(0) is null; the whole block is dead by construction.
-#     * Deactivated()'s id-match Submit -- 1 line.  Reached only when
-#       connection->Id() == _connectionId; Thunder allocates connection ids from 1 and
-#       _connectionId is 0 in-process, so the comparison can never hold at L2.
-#   Reaching any of these at L2 would require an out-of-process plugin host or a change to
-#   Thunder or to the plugin itself -- production code, which is out of scope.  The verdict is
-#   therefore waived HERE, at the point of measurement, with the file kept in the denominator
-#   and its real 75.5% printed.  It is not filtered out and COVERAGE_MIN is not lowered.
+#   plugin/HdmiCecSource.cpp at L2 -- MEASURED at 33/53 = 62.3%.  That figure, and the
+#   enumeration below, are what the current tree actually reports; an earlier revision of this
+#   comment quoted a 40/53 = 75.5% "ceiling" over thirteen lines, and both numbers were wrong.
+#   The measured total is TWENTY uncovered lines, and the two groups the old accounting missed
+#   are named explicitly here so the arithmetic reconciles: Deactivated() contributes four
+#   instrumented lines rather than one, and the non-STB profile rejection contributes four that
+#   were not accounted for at all.  Grouped by what actually blocks each line:
+#     * the out-of-process teardown block -- 7 lines (129, 131, 133-136, 138).  At L2 the
+#       implementation is resolved IN-PROCESS by _service->Root<>(), so _connectionId stays 0,
+#       _service->RemoteConnection(0) returns null, and Terminate(), its catch arm and Release()
+#       are dead by construction.  The suite log corroborates it: "Failed to terminate
+#       connection" appears zero times across the whole run.
+#     * Deactivated(RPC::IRemoteConnection*) -- 4 lines (154, 156, 159, 161).  Thunder calls
+#       this only when an out-of-process connection dies, and the id comparison could not hold
+#       even then: Thunder allocates connection ids from 1 while _connectionId is 0 in-process.
+#     * the Root<> failure arm -- 3 lines (87, 88, 93).  A live Thunder host resolves Root<>
+#       against an installed, loadable implementation library; there is no L2 seam that makes it
+#       return null, and manufacturing one would be a production change.  Covered at L1, where
+#       the COMLink is a mock.
+#     * Information() -- 2 lines (149, 151).  PluginHost::IPlugin::Information() is declared
+#       pure virtual at Thunder/Source/plugins/IPlugin.h:97 and is called NOWHERE in Thunder
+#       R4.4.1; a grep of Thunder/Source finds only the Controller's own override.
+#     * the non-STB profile rejection -- 4 lines (61, 62, 112, 113).  These ARE reachable at L2
+#       and are not claimed otherwise: a test could deactivate the plugin, rewrite the
+#       host-global /etc/device.properties to a non-STB profile and reactivate -- exactly what
+#       the sink repository's PluginRefusesToActivateUnderANonSinkProfile does at L2.  They are
+#       left uncovered as a deliberate, stated decision: covering them gives 37/53 = 69.8%,
+#       still short of the bar, so it would not change this verdict, and the same four lines are
+#       already covered by this repository's L1 suite.
+#   This repository's own L1 suite measures the SAME file at 53/53 = 100%, so the TARGET meets
+#   the section-0.9.2 bar; what sits below the bar is this one LEVEL's view of it.  The verdict
+#   is therefore waived HERE, at the point of measurement, with the file kept in the denominator
+#   and its real 62.3% printed.  It is not filtered out and COVERAGE_MIN is not lowered.
 # ------------------------------------------------------------------------------------
 readonly L1_GATE_EXEMPT=(
     'plugin/Module.cpp'
@@ -503,21 +535,9 @@ readonly L2_GATE_EXEMPT=(
 # exactly, with no margin added or subtracted.  They exist because the L2 level had no floor at all
 # until this script existed, so nothing protected the level's gain from 72.4%.
 #
-# REVISED TWICE, and both revisions are recorded rather than quietly absorbed.
-#
-# FIRST REVISION.  An earlier run recorded
-#     plugin/HdmiCecSource.h=95.2  plugin/HdmiCecSourceImplementation.h=89.5
-#     plugin/HdmiCecSourceImplementation.cpp=84.8
-# from a suite of seventy-two TEST_F cases whose aggregate was 85.1% (842/989).  A code review read
-# the specification's file map as fixing this translation unit at EXACTLY fifty-nine cases and
-# recorded the thirteen surplus cases as a MAJOR contract breach; they were removed, the floors were
-# re-measured from the fifty-nine-case tree at aggregate 71.0% (702/989), and this script was left
-# recording that the 80% bar could not be reached at L2 because "the only lever is adding L2 cases,
-# and the exact-content contract forbids that".
-#
-# SECOND REVISION -- THAT READING IS SUPERSEDED, AND THE REVERSAL IS STATED HERE SO IT IS NOT
-# SILENT.  The specification's frozen artefact is the SET OF PATHS it transforms, not a per-file
-# case count, and it assigns this level additive cases in three separate places:
+# WHAT THE FROZEN SPECIFICATION DOES AND DOES NOT FIX, because the floors below depend on it.
+# The specification's frozen artefact is the SET OF PATHS it transforms, NOT a per-file case
+# count, and it assigns this level additive cases in three separate places:
 #   * Sec. 0.3.1 -- "update HdmiCecSink_L2Test.cpp and HdmiCecSource_L2Test.cpp with additive cases";
 #   * Sec. 0.9.2 -- the implementation-file coverage targets are to be delivered by "Updated L1 AND
 #     L2 files", naming both levels explicitly;
@@ -525,21 +545,20 @@ readonly L2_GATE_EXEMPT=(
 #     capturing them "could shift the effort distribution between L1 and L2 additions".
 # Sec. 0.1.3 makes the quantified >= 80% requirement the primary acceptance gate, and Sec. 0.6.1.2
 # says L2 additions are made "through the existing transport helpers" in the existing fixture --
-# which is what the cases added since do, every one of them appended beside a passing case and none
-# of them rewriting one.  A fifty-nine-case ceiling would make the primary gate unreachable by the
-# very mechanism the specification prescribes for reaching it, so the count is not a contract and
-# the earlier "contract breach" finding does not apply to additive, gap-derived cases.  What the
-# frozen map DOES police is which files change, and that is unaltered: this level's additions are
-# confined to the one L2 translation unit the map already lists as an UPDATE.
+# which is what this level's cases do, every one of them appended beside a passing case and none
+# of them rewriting one.  Treating a per-file case count as fixed would make the primary gate
+# unreachable by the very mechanism the specification prescribes for reaching it, so the count is
+# not a contract.  What the frozen map DOES police is which files change, and that is unaltered:
+# this level's additions are confined to the one L2 translation unit the map lists as an UPDATE.
+# Note also that the specification prohibits removing any test or test case, so a case count can
+# only ever be reduced by a decision outside this engagement -- never by this script's authors.
 #
-# The floors below are re-measured from the current tree: 64 of 64 cases green, aggregate 80.2%
-# (793/989), with plugin/HdmiCecSourceImplementation.cpp at 80.5% (671/834).  THE LEVEL NOW MEETS
-# THE 80% BAR, so the earlier note recording an unreachable gap no longer applies and has been
-# removed rather than left to mislead.  The gap was closed the only permitted way -- by adding
-# tests.  No exclusion glob was added, COVERAGE_MIN was not lowered, no extra file was waived, and
-# no production source was touched.
+# The floors below are measured from the current tree: 64 of 64 cases green, aggregate 80.2%
+# (793/989), with plugin/HdmiCecSourceImplementation.cpp at 80.5% (671/834).  THE LEVEL MEETS THE
+# 80% BAR, and it does so the only permitted way -- by adding tests.  No exclusion glob was added,
+# COVERAGE_MIN was not lowered, no extra file was waived, and no production source was touched.
 #   plugin/HdmiCecSource.cpp is deliberately NOT given an L2 floor: it is enumerated in
-#   L2_GATE_EXEMPT at its hard 62.3% ceiling, and a floor on a waived verdict would be a
+#   L2_GATE_EXEMPT at its measured 62.3%, and a floor on a waived verdict would be a
 #   second, contradictory judgement on the same file.
 # ------------------------------------------------------------------------------------
 readonly L1_COVERAGE_FLOORS=(
@@ -576,9 +595,9 @@ rule() { printf '%s\n' '--------------------------------------------------------
 # privileges.  On a CI runner that is a write into another job's workspace; run under
 # sudo, it is a write anywhere.
 #
-# Checking only the leaf, which is what this script used to do, does not close that: the
-# leaf can be perfectly ordinary while its PARENT is the substitution.  So the whole chain
-# from / down is checked, and every existing component must satisfy all three of:
+# Checking only the leaf does not close that, and must not be reduced to it: the leaf can be
+# perfectly ordinary while its PARENT is the substitution.  So the whole chain from / down is
+# checked, and every existing component must satisfy all three of:
 #
 #   * not a symbolic link.  A link is exactly the substitution being defended against, and
 #     resolving it first (`pwd -P`, `mkdir -p`) would validate the target while the write
@@ -802,13 +821,11 @@ assert_artifact_path_still_safe() { # $1=artifact path about to be written (opti
 #
 # The caller's $HOME is not touched at all to achieve that.  lcov and genhtml are given a
 # private, empty, mode-0700 HOME of their own, created with mktemp -d, and every invocation
-# goes through the lcov_run/genhtml_run wrappers below.  Nothing is moved, nothing is
-# deleted, nothing can reappear inside it, and there is nothing to restore -- so the
-# stash-and-restore scheme this script used to carry, and the two ways it could go wrong
-# (destroying a reappeared ~/.lcovrc with `mv -f`, and letting a mid-run recreation apply to
-# every later lcov call), are gone rather than mitigated.
+# goes through the lcov_run/genhtml_run wrappers below.  Nothing of the caller's is moved or
+# deleted, nothing can reappear inside a directory this run just created, and there is nothing
+# to restore -- which is why no configuration file anywhere is relocated or rewritten here.
 #
-# An unset HOME is not a special case any more either: nothing here reads the caller's HOME.
+# An unset HOME is not a special case: nothing here reads the caller's HOME.
 # /etc/lcovrc is system-wide and out of scope; --config-file, when this repository ships one
 # for the level, means lcov reads that file instead, and --rc branch_coverage=1 outranks
 # every configuration source regardless.
@@ -830,19 +847,16 @@ cleanup_lcov_home() {
 
 # Give lcov a HOME of its own, and leave the caller's completely alone.
 #
-# What this step needs is only that NO home configuration is in effect while lcov runs.
-# Moving $HOME/.lcovrc aside and moving it back -- which is what this script used to do --
-# achieves that unreliably and destructively: the restoring `mv -f` overwrites whatever
-# stands at $HOME/.lcovrc at that moment, so a file that REAPPEARED during the run (the
-# owner recreating it, or one of the two sibling runners in this workspace, which stash the
-# same path) is silently destroyed by a script that was only supposed to measure.  And
-# until the restore, a file recreated mid-run was in effect for every lcov call after it --
-# the very thing the stash existed to prevent, made worse by the "already stashed" early
-# return, which made the second check a no-op.
+# What this step needs is only that NO home configuration is in effect while lcov runs, and an
+# empty, mode-0700, unpredictably named directory supplies that outright: nothing is moved,
+# nothing is deleted, nothing can reappear inside it, and there is nothing to restore.
 #
-# An empty, mode-0700, unpredictably named directory has neither failure mode.  Nothing is
-# moved, nothing is deleted, nothing can reappear inside it, and there is nothing to
-# restore.
+# DO NOT replace this with moving $HOME/.lcovrc aside and back.  That approach fails two ways
+# no amount of care inside it can fix.  The restoring `mv -f` overwrites whatever stands at
+# $HOME/.lcovrc at that moment, so a file recreated during the run -- by its owner, or by
+# either sibling runner in this workspace if one were ever changed to write there -- would be
+# destroyed by a script whose only job is to measure.  And until the restore, a file recreated
+# mid-run applies to every lcov call after it, which is the very thing being prevented.
 make_private_lcov_home() {
     [ -n "$MKTEMP_BIN" ] || die "mktemp is required to create a private HOME for lcov."
     local parent="${TMPDIR:-/tmp}"
@@ -887,6 +901,162 @@ trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
+
+
+# ------------------------------------------------------------------------------------
+# Words the reference audit must NOT treat as a command or as a shell variable, each
+# with the reason it is not one.  The scanner reads shell text with grep, so it cannot
+# distinguish a shell command from a word inside a single-quoted awk program, a heredoc
+# or a filename literal; this list is the complete set of such words in this script and
+# anything not listed has to resolve.  Keep it short -- a growing list is the sign that
+# the audit is being worked around rather than satisfied.
+#   is_exempt          awk-local in the per-file table program
+#   legacy_hit         awk-local in the trace-record parser
+#   legacy_seen        awk-local in the trace-record parser
+#   valgrind_log       artifact FILENAME written under the level's artifact directory
+#   GITHUB_WORKSPACE   named in the usage heredoc as CI's variable; never expanded here
+# ------------------------------------------------------------------------------------
+SELFTEST_NOT_A_COMMAND='is_exempt
+legacy_hit
+legacy_seen
+valgrind_log
+GITHUB_WORKSPACE'
+readonly SELFTEST_NOT_A_COMMAND
+
+# ------------------------------------------------------------------------------------
+# SELF-REFERENCE AUDIT, and the `selftest` subcommand built on it.
+#
+# WHY THIS EXISTS.  This script is long, it runs under `set -euo pipefail`, and bash resolves
+# a command name only when control reaches it.  A call to a function that does not exist, or an
+# expansion of a variable that was never defined, is therefore invisible to `bash -n`, invisible
+# to shellcheck, and invisible until the run is already under way -- at which point it aborts
+# with `command not found` or `unbound variable` after the banner has printed, having produced
+# no measurement.  Two real defects of exactly that shape were found in this workspace's
+# runners: calls to a `prepare_lcov_home` that was never defined alongside wrappers built over
+# an undefined `LCOV_HOME_DIR`, and a per-file gate that expanded an undefined
+# `COVERAGE_GATE_EXEMPT_FILES` the moment any file fell below the bar.
+#
+# WHAT IT CHECKS.  Two things, statically, over this script's own text:
+#   1. Every snake_case word in a command position resolves -- to a function defined here, a
+#      variable this script assigns, a shell builtin, or an executable on PATH.
+#   2. Every ${UPPER_CASE} expansion is either assigned by this script, written with a default
+#      (${X:-...}, ${X-...}, ${X+...}), or already exported in the environment.
+#
+# THE ONE BLIND SPOT, NAMED RATHER THAN GLOSSED OVER.  The scanner reads shell text with grep,
+# so it cannot tell a shell command from a word inside a single-quoted awk program, a
+# heredoc, or a filename literal.  Those tokens are listed in SELFTEST_NOT_A_COMMAND below,
+# each with the reason it is not a call.  Everything else must resolve; the list is the
+# complete set of exceptions and a reader can check every entry against the source.
+#
+# WHEN IT RUNS.  Always, as main()'s first act, before any validation, any filesystem write and
+# any lcov invocation -- so a script that cannot resolve its own references reports exactly
+# that and touches nothing.  `selftest` runs the audit plus the tooling pre-flight and stops
+# there: no suite, no counters zeroed, no capture, no artifact directory.
+# ------------------------------------------------------------------------------------
+reference_audit() {
+    local body defined assigned locals called globals defaulted setglob w failures=0
+    [ -r "$SCRIPT_PATH" ] || die "cannot read this script back for the reference audit: $SCRIPT_PATH"
+
+    body="$(grep -vE '^[[:space:]]*#' -- "$SCRIPT_PATH" || true)"
+    defined="$(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)' -- "$SCRIPT_PATH" | tr -d '()' | sort -u)"
+    assigned="$(printf '%s\n' "$body" | grep -oE '(^|[[:space:]]|\(|;)[a-z][a-z0-9_]*=' | grep -oE '[a-z][a-z0-9_]*' | sort -u)"
+    locals="$(printf '%s\n' "$body" | grep -oE '\b(local|read -r|read)[[:space:]]+([a-z][a-z0-9_]*[[:space:]]*)+' | grep -oE '[a-z][a-z0-9_]*' | sort -u)"
+    called="$(printf '%s\n' "$body" \
+        | grep -oE '(^|[[:space:]]|;|\||&|\(|!)[[:space:]]*[a-z][a-z0-9]*(_[a-z0-9]+)+([[:space:]]|$|\))' \
+        | grep -oE '[a-z][a-z0-9]*(_[a-z0-9]+)+' | sort -u)"
+
+    for w in $called; do
+        printf '%s\n' "$defined"                | grep -qx -- "$w" && continue
+        printf '%s\n' "$assigned"               | grep -qx -- "$w" && continue
+        printf '%s\n' "$locals"                 | grep -qx -- "$w" && continue
+        printf '%s\n' "$SELFTEST_NOT_A_COMMAND" | grep -qx -- "$w" && continue
+        command -v -- "$w" >/dev/null 2>&1 && continue
+        warn "reference audit: '$w' is used in a command position but is not a function defined"
+        warn "    here, not a variable this script assigns, not a builtin and not on PATH."
+        failures=$((failures + 1))
+    done
+
+    globals="$(printf '%s\n' "$body" | grep -oE '\$\{?[A-Z][A-Z0-9_]*' | grep -oE '[A-Z][A-Z0-9_]*' | sort -u)"
+    defaulted="$(printf '%s\n' "$body" | grep -oE '\$\{[A-Z][A-Z0-9_]*[:+-]' | grep -oE '[A-Z][A-Z0-9_]*' | sort -u)"
+    setglob="$(grep -oE '^[[:space:]]*(export[[:space:]]+|readonly[[:space:]]+|local[[:space:]]+|declare[[:space:]]+-[a-zA-Z]+[[:space:]]+)?[A-Z][A-Z0-9_]*(=|\+=|\()' -- "$SCRIPT_PATH" \
+        | grep -oE '[A-Z][A-Z0-9_]*' | sort -u)"
+    for w in $globals; do
+        printf '%s\n' "$setglob"                | grep -qx -- "$w" && continue
+        printf '%s\n' "$defaulted"              | grep -qx -- "$w" && continue
+        printf '%s\n' "$SELFTEST_NOT_A_COMMAND" | grep -qx -- "$w" && continue
+        [ -n "${!w+x}" ] && continue
+        warn "reference audit: \$$w is expanded but is never assigned here, has no default form"
+        warn "    (\${$w:-...}) and is not set in the environment; under 'set -u' that aborts the run."
+        failures=$((failures + 1))
+    done
+
+    # STAGE 3: a reference written WITH a default but never assigned anywhere.
+    #
+    # Stage 2 deliberately accepts \${X:-...} because it cannot abort under 'set -u'.  That is
+    # exactly what let a real defect through: the sink runner read \${STAT_BIN:-} in path_metadata()
+    # but never assigned STAT_BIN, so the guard was permanently empty and every run died at the
+    # first artifact-ancestry check with "stat was not found on PATH" while /usr/bin/stat was on
+    # PATH all along.  Safe from 'set -u', and wrong in every run - so the default form has to be
+    # audited too, not treated as proof of resolution.
+    #
+    # Names that are genuinely read from the environment and are MEANT to be unassigned here are
+    # listed below with the reason.  Every other tool handle, path and tunable this script uses is
+    # assigned in one place, so the list stays short by construction.
+    #   TMPDIR - a standard environment variable; \${TMPDIR:-/tmp} is the documented way to read it
+    #   X      - not a variable: it appears as \${X:-...} inside this audit's own explanatory
+    #            comment, describing the default FORM rather than naming a real reference
+    for w in $defaulted; do
+        printf '%s\n' "$setglob" | grep -qx -- "$w" && continue
+        #   CLONE_INDEX - set by the workspace environment to distinguish parallel clones.
+        #                 Read only by write_provenance, and only to RECORD which clone produced
+        #                 an artifact; "unset" is a truthful value there, so an empty read is
+        #                 correct behaviour rather than a silent failure.
+        #   CXX         - the standard compiler environment variable.  write_provenance reads it
+        #                 to record which compiler produced the instrumentation, falling back to
+        #                 g++, which is the same convention the build itself uses.
+        case " TMPDIR X CLONE_INDEX CXX " in
+            *" $w "*) continue ;;
+        esac
+        warn "reference audit: \$$w is only ever read with a default (\${$w:-...}) and is never"
+        warn "    assigned by this script.  It cannot abort the run, so it will silently be empty"
+        warn "    every time - which makes whatever depends on it dead or permanently failing."
+        warn "    Either assign it, or add it to this stage's environment-only list with a reason."
+        failures=$((failures + 1))
+    done
+
+    if [ "$failures" -ne 0 ]; then
+        die "the reference audit found $failures unresolved name(s) in this script.
+       Every one of them would abort a real run part-way through, after the banner and
+       before any measurement.  Fix the name, or -- if it is genuinely not a shell
+       command (a word inside an embedded awk program, a heredoc, or a filename) -- add
+       it to SELFTEST_NOT_A_COMMAND with the reason."
+    fi
+    return 0
+}
+
+selftest() {
+    rule
+    log "SELF-TEST: no suite is run, no counters are zeroed, nothing is captured and no"
+    log "  artifact directory is created.  The only filesystem effect is the private empty"
+    log "  HOME the lcov capability probe needs, which the cleanup trap removes."
+    rule
+    log "1/3 re-parsing this script"
+    bash -n -- "$SCRIPT_PATH" || die "this script does not parse: $SCRIPT_PATH"
+    log "    parses cleanly"
+    log "2/3 auditing every internal function and variable reference"
+    reference_audit
+    log "    every reference resolves"
+    log "3/3 measurement tooling pre-flight"
+    # preflight() asks lcov for its version and its option list, so the private empty HOME the
+    # lcov steps run with has to exist first -- exactly as main() orders them.  It is a
+    # mode-0700 mktemp directory outside the tree, removed by the cleanup trap, and it is the
+    # only thing this subcommand creates.
+    make_private_lcov_home
+    preflight
+    log "    tooling present and usable"
+    rule
+    log "SELF-TEST PASSED"
+}
 
 usage() {
     cat <<USAGE
@@ -945,6 +1115,10 @@ Environment variables (all optional; shown with their defaults):
                                  100, 80.5) and between 0 and 100; anything else is refused
                                  rather than coerced, because a coerced bar would yield a
                                  gate verdict for a percentage nobody asked for.
+                                 ANY VALUE OTHER THAN 80 MAKES THE RUN ADVISORY (exit 3),
+                                 never exit 0: Directive 4 fixes the bar at 80, so another
+                                 value measures something real but certifies nothing -- and
+                                 COVERAGE_MIN=0 would otherwise pass every possible tree.
                                  Currently: $COVERAGE_MIN
   RUN_VALGRIND=0                 Set to 1/true/yes/on to run the suite under valgrind
                                  memcheck with the options CI uses.  Never a gate.
@@ -1132,6 +1306,13 @@ preflight() {
     [ -n "$MKTEMP_BIN" ]  || die "mktemp not found on PATH."
     [ -n "$STAT_BIN" ]    || die "stat not found on PATH; it is how artifact paths are validated
        before anything is written to them."
+    # timeout is used unconditionally by run_suite() and run_level_rebuild_hook(), and
+    # resolve_tool leaves it EMPTY rather than unset when it is absent, so `set -u` will not
+    # catch it.  Refuse here, where the message can say what is missing and why, instead of
+    # failing with a bare "command not found" once a suite is already being started.
+    [ -n "$TIMEOUT_BIN" ] || die "timeout not found on PATH; it bounds every suite and every
+       rebuild hook this script starts, so without it a hung run would never end.  It ships
+       with coreutils, so its absence means PATH is unusually restricted."
 
     # lcov must actually be runnable before anything else is believed about it.  A broken or
     # hostile configuration file makes EVERY invocation fail -- `lcov --version` included -- so
@@ -1197,9 +1378,22 @@ preflight() {
     esac
     awk -v v="$COVERAGE_MIN" 'BEGIN { exit !(v + 0 >= 0 && v + 0 <= 100) }' \
         || die "COVERAGE_MIN must be between 0 and 100 (got '$COVERAGE_MIN')."
+    # A BAR THAT IS NOT 80 CANNOT PRODUCE AN ACCEPTANCE VERDICT.
+    #
+    # Directive 4 fixes the bar at 80% per target, so a run with any other value is measuring
+    # against a threshold nobody agreed to.  Warning and then exiting 0 with "COVERAGE GATE
+    # PASSED" printed is the problem: to a CI step, to a reader of a log tail, and to anything
+    # keying on the exit status, that is indistinguishable from a run that cleared the real bar -
+    # and COVERAGE_MIN=0 makes every conceivable tree pass.  The figures are still produced and
+    # are still real; what an arbitrary bar cannot do is certify them, so the verdict becomes
+    # ADVISORY and the exit status says so.
     if awk -v v="$COVERAGE_MIN" 'BEGIN { exit !(v + 0 != 80) }'; then
         warn "COVERAGE_MIN is ${COVERAGE_MIN}%, not the required 80%.  This is a diagnostic run:"
         warn "    its verdict is NOT the acceptance verdict for this submodule."
+        note_advisory "COVERAGE_MIN was ${COVERAGE_MIN}%, not the 80% the specification requires
+       (section 0.1.3, Directive 4), so the gate below was applied against a threshold this
+       project did not set.  Every figure printed is measured and real; what this run cannot do
+       is certify them.  Re-run without COVERAGE_MIN, or with COVERAGE_MIN=80, for a verdict."
     fi
 
     # The bounds are validated by shape and by range for the same reason the bar is: `timeout`
@@ -1234,15 +1428,114 @@ suite_timeout_for_level() { # $1=level -> seconds on stdout
 
 # lcov refuses to read a tree with no coverage data, but the error is generic; naming the
 # actual cause (unbuilt tree, wrong directory, uninstrumented build) saves the reader a hunt.
+# ------------------------------------------------------------------------------------
+# BUILD-ROOT VALIDATION, BEFORE ANYTHING DESTRUCTIVE TOUCHES IT.
+#
+# zero_counters() below runs `lcov -z -d "$dir"`, which walks the tree and UNLINKS every
+# *.gcda it finds, and the diagnostics this script prints tell a reader to finish the job with
+# `find '$dir' -name '*.gcda' -type f -delete`.  Both are recursive deletions inside a
+# directory the CALLER chose through BUILD_DIR / L1_BUILD_DIR / L2_BUILD_DIR.
+#
+# "It exists and has a .gcno somewhere under it" is not enough to justify that.  A workspace
+# root, a repository root, a home directory or the sibling plugin's tree all satisfy it as soon
+# as one instrumented object exists anywhere beneath them, and the deletion then reaches
+# everything else in the same subtree - including another plugin's measurement evidence, which
+# is exactly the collision this script exists to police everywhere else.
+#
+# So the root has to prove four things, and a failure is refused rather than warned about:
+#   1. It is an absolute, non-trivial path, and not '/'.
+#   2. Its whole ancestry is safe - no symlink component, every component a directory owned by
+#      this user or root and not writable by anyone else without a sticky bit.  This reuses the
+#      same assert_safe_ancestry() the artifact root uses, with "named" strictness, because a
+#      caller-supplied build directory is predictable by construction.
+#   3. It is neither the repository root nor the workspace root nor any ANCESTOR of the
+#      repository root.  Deleting recursively from above the source tree would reach the source
+#      tree, and no build directory ever needs to.
+#   4. It is a CMake build tree whose CMakeCache.txt names THIS repository as its source
+#      directory.  That is the decisive, target-specific check: the sink's build tree, an
+#      unrelated project's build tree and a directory that merely happens to contain a stray
+#      .gcno are all rejected by it, and it is the same fingerprint CMake itself trusts.
+#
+# Only after all four does the instrumentation check run, because "nothing is instrumented
+# here" is a build problem, whereas the four above are "do not delete this" problems.
+# ------------------------------------------------------------------------------------
 validate_build_dir() {
-    local dir="$1" level="$2" gcno
+    local dir="$1" level="$2" gcno cache home_dir
+
+    # 1. Absolute, non-trivial, not the filesystem root.  Asked BEFORE existence: "does the
+    #    directory exist" has no single answer for a relative value, because what it is relative
+    #    to is the very thing being refused.  Testing existence first reported a relative
+    #    BUILD_DIR as "does not exist", which sends the reader off to build a tree that was
+    #    already built and merely named wrongly.
+    case "$dir" in
+        /)  die "the ${level^^} build directory must not be '/'.  This script resets coverage
+       counters by deleting *.gcda recursively underneath it." ;;
+        /*) : ;;
+        *)  die "the ${level^^} build directory must be an ABSOLUTE path (got '$dir').
+       A relative path is resolved against whatever directory the caller happened to be in, and
+       this script deletes *.gcda recursively underneath it.  Set ${level^^}_BUILD_DIR or
+       BUILD_DIR to an absolute path." ;;
+    esac
+    [ "${#dir}" -gt 4 ] || die "the ${level^^} build directory '$dir' is implausibly short.
+       Coverage counters are deleted recursively underneath it, so a near-root path is refused."
+
+    # 2. It exists -- now that the value means exactly one place.
     [ -d "$dir" ] || die "build directory for ${level^^} does not exist: $dir
        Build the plugin first -- run '$(basename -- "$SCRIPT_PATH") --help-build' for the recipe --
        or point ${level^^}_BUILD_DIR/BUILD_DIR at the tree that holds this plugin's *.gcno files."
+
+    # 3. The whole chain down to it, with caller-named strictness.
+    assert_safe_ancestry "$dir" named
+
+    # 4. Not the source tree, and not above it.
+    if [ "$dir" = "$REPO_ROOT" ]; then
+        die "the ${level^^} build directory is the repository itself: $dir
+       This script deletes *.gcda recursively underneath it, which would reach the checked-out
+       source tree.  Use an out-of-source build directory (CI uses \$WS/build/$REPO_NAME)."
+    fi
+    if [ "$dir" = "$WS" ]; then
+        die "the ${level^^} build directory is the workspace root: $dir
+       Every repository, every install tree and the other plugin's build tree all live under it,
+       and this script deletes *.gcda recursively underneath whatever it is given.  Point
+       ${level^^}_BUILD_DIR at this plugin's own build tree."
+    fi
+    case "$REPO_ROOT/" in
+        "$dir"/*) die "the ${level^^} build directory $dir is an ANCESTOR of the repository
+       $REPO_ROOT
+       Deleting coverage counters recursively from above the source tree would reach the source
+       tree.  Point ${level^^}_BUILD_DIR at this plugin's own out-of-source build tree." ;;
+    esac
+
+    # 5. A CMake build tree, and THIS repository's.
+    cache="$dir/CMakeCache.txt"
+    [ -f "$cache" ] || die "no CMakeCache.txt at $cache, so $dir is not a CMake build tree.
+       This script resets coverage counters by deleting *.gcda recursively underneath the
+       directory it is given, so it will only do that inside a directory that identifies itself
+       as the build tree of this plugin.  Point ${level^^}_BUILD_DIR/BUILD_DIR at the tree
+       produced by 'cmake -S $REPO_ROOT -B <dir>' (see
+       '$(basename -- "$SCRIPT_PATH") --help-build')."
+    home_dir="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$cache" | head -1)"
+    [ -n "$home_dir" ] || die "CMakeCache.txt at $cache records no CMAKE_HOME_DIRECTORY, so it
+       cannot be established which source tree that build directory belongs to.  Refusing to
+       delete coverage counters inside it.  Reconfigure the tree with a supported CMake."
+    if [ "$home_dir" != "$REPO_ROOT" ]; then
+        die "the ${level^^} build directory belongs to a DIFFERENT source tree:
+       build tree      : $dir
+       its source tree : $home_dir
+       this repository : $REPO_ROOT
+       Coverage counters are deleted recursively inside the build tree, and its objects are what
+       the capture reads -- so measuring here would both damage another project's evidence and
+       report its figures under this plugin's name.  entservices-hdmicecsink in particular builds
+       into an identically named library, so this is the collision that check exists for.  Point
+       ${level^^}_BUILD_DIR at the tree configured from $REPO_ROOT."
+    fi
+
+    # 6. Only now: is anything here actually instrumented?
     gcno="$("$FIND_BIN" "$dir" -name '*.gcno' -print -quit 2>/dev/null || true)"
     [ -n "$gcno" ] || die "no *.gcno files under $dir, so nothing there is instrumented for coverage.
        Configure with Tests/gcc-with-coverage.cmake in CMAKE_CXX_FLAGS (it appends --coverage)
        and rebuild; see '$(basename -- "$SCRIPT_PATH") --help-build'."
+    log "${level^^} build tree validated: $dir (CMake source dir = $home_dir)"
 }
 
 validate_install_dir() {
@@ -1326,9 +1619,9 @@ verify_library_provenance() {
        SKIP_LIBRARY_PROVENANCE_CHECK=1 to override deliberately."
     fi
 
-    # BOTH conditions, not a majority vote.  This used to fail only when the rival's symbols
-    # OUTNUMBERED this plugin's, which accepted a library carrying both -- and a library carrying
-    # both is exactly what a mixed or partially reinstalled tree produces.  The two plugins emit
+    # BOTH conditions, not a majority vote.  Failing only when the rival's symbols OUTNUMBERED
+    # this plugin's would accept a library carrying both -- and a library carrying both is exactly
+    # what a mixed or partially reinstalled tree produces.  The two plugins emit
     # the same library name, so "some sink symbols are in here" already means the coverage figure
     # cannot be attributed cleanly: the sink's cases would run against the sink's objects while
     # this run credits this plugin's.  A single rival symbol is therefore disqualifying, and this
@@ -1392,9 +1685,9 @@ resolve_level_inputs() {
     # RESOLVED here, CREATED later.  This function only decides where the artifacts will go;
     # create_level_artifact_dir() below makes the directory, and it is called after this
     # level's build and install trees have been validated.  The split exists because a run
-    # that died at preflight -- an unbuilt tree, the other plugin's install tree, a missing
-    # test binary -- used to leave an empty $ARTIFACT_ROOT/<repo>/<level>/ behind it, so a
-    # failed run mutated the filesystem before establishing it could measure anything.
+    # that dies at preflight -- an unbuilt tree, the other plugin's install tree, a missing test
+    # binary -- must not leave an empty $ARTIFACT_ROOT/<repo>/<level>/ behind it, because that
+    # would mutate the filesystem before establishing that anything can be measured at all.
     LEVEL_ARTIFACT_DIR="$ARTIFACT_ROOT/$REPO_NAME/$level"
     assert_artifact_dir_safe
 }
@@ -1553,10 +1846,139 @@ create_level_artifact_dir() {
 # obvious cause.  Both entries are computed from the pristine base paths so that a second
 # level cannot inherit the first level's install tree.
 # ------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
+# RUNTIME SEARCH PATHS, BUILT FROM VALIDATED COMPONENTS AND WITH NO EMPTY ELEMENT.
+#
+# An EMPTY element in PATH or LD_LIBRARY_PATH means THE CURRENT DIRECTORY to the loader and to
+# execvp.  Concatenating an inherited value that happens to be empty -
+#     LD_LIBRARY_PATH="$install/usr/lib:$install/usr/lib/wpeframework/plugins:$BASE_LD_LIBRARY_PATH"
+# - leaves a trailing colon and therefore puts the working directory on the library search path
+# of a suite that is about to be run for a gate verdict.  The working directory here is the
+# parent of the install tree, which is $WS in CI and holds every checked-out repository: a file
+# named like a dependency sitting there would be loaded in preference to nothing at all.  The
+# same applies to PATH and $BASE_PATH.
+#
+# So the paths are assembled element by element:
+#   * the two install directories this run needs come first and are validated;
+#   * each inherited element is carried over ONLY if it is non-empty, absolute, an existing
+#     directory, not a symlink, and not writable by group or world without a sticky bit;
+#   * an element that fails is DROPPED with a named reason rather than silently kept - dropping
+#     a search path can only make a lookup fail loudly, whereas keeping a writable one lets
+#     something else be loaded quietly;
+#   * nothing is ever appended when the inherited variable is empty, so no trailing colon and
+#     no implicit '.' can survive.
+#
+# Relative and empty elements are refused rather than resolved, because "resolve it against the
+# current directory" is the behaviour being removed.
+# ------------------------------------------------------------------------------------
+# $2 is the ROLE-BEARING NAME used in the diagnostic -- "the inherited LD_LIBRARY_PATH" for an
+# element this run received, "this run's own PATH" for one of the leading elements it supplies
+# itself.  The verb is "rejecting" rather than "dropping" because the two callers do different
+# things with a rejection: sanitise_search_path() omits the element and continues,
+# setup_runtime_env() stops the run.  Saying "dropping ... from the inherited PATH" for a leading
+# element, which is what this used to print, described neither correctly.
+loader_element_is_safe() { # $1=element  $2=role-bearing name for the message -> 0 = keep
+    local element="$1" varname="$2" meta uid rest mode kind numeric_mode
+
+    if [ -z "$element" ]; then
+        warn "rejecting an EMPTY element of $varname: an empty element means the"
+        warn "    current working directory, which would put it on the search path of the suite"
+        warn "    this run gates."
+        return 1
+    fi
+    case "$element" in
+        /*) : ;;
+        *)  warn "rejecting the relative element '$element' of $varname: it would"
+            warn "    be resolved against the working directory of the suite run."
+            return 1 ;;
+    esac
+    if [ -L "$element" ]; then
+        warn "rejecting '$element' of $varname: it is a symbolic link, and what it"
+        warn "    points at can be changed underneath the run."
+        return 1
+    fi
+    meta="$(path_metadata "$element")"
+    if [ -z "$meta" ]; then
+        warn "rejecting '$element' of $varname: it does not exist or cannot be"
+        warn "    stat'ed, so nothing about it can be checked."
+        return 1
+    fi
+    uid="${meta%% *}"; rest="${meta#* }"; mode="${rest%% *}"; kind="${rest#* }"
+    if [ "$kind" != directory ]; then
+        warn "rejecting '$element' of $varname: it is a $kind, not a directory."
+        return 1
+    fi
+    numeric_mode="$(( 8#$mode ))"
+    if [ "$(( numeric_mode & 0022 ))" -ne 0 ] && [ "$(( numeric_mode & 01000 ))" -eq 0 ]; then
+        warn "rejecting '$element' (mode $mode) of $varname: it is writable by"
+        warn "    group or world with no sticky bit, so any local account could place a binary or"
+        warn "    library there and have this run load it in preference to the real one."
+        return 1
+    fi
+    if [ "$uid" != "$EUID_VALUE" ] && [ "$uid" != 0 ]; then
+        warn "rejecting '$element' (owned by uid $uid) of $varname: it is owned by"
+        warn "    neither this user ($EUID_VALUE) nor root, so its contents are under someone"
+        warn "    else's control."
+        return 1
+    fi
+    return 0
+}
+
+# Join the validated leading elements with whatever inherited elements survive the check.
+sanitise_search_path() { # $1=variable name  $2=inherited value  $3..=leading elements
+    local varname="$1" inherited="$2"
+    shift 2
+    local result='' element
+    for element in "$@"; do
+        [ -n "$element" ] || continue
+        if [ -z "$result" ]; then result="$element"; else result="$result:$element"; fi
+    done
+    local saved_ifs="$IFS"
+    IFS=':'
+    # Deliberate word splitting on ':' to walk the inherited elements in order.
+    # shellcheck disable=SC2086
+    set -- $inherited
+    IFS="$saved_ifs"
+    for element in "$@"; do
+        if loader_element_is_safe "$element" "the inherited $varname"; then
+            if [ -z "$result" ]; then result="$element"; else result="$result:$element"; fi
+        fi
+    done
+    printf '%s' "$result"
+}
+
 setup_runtime_env() {
-    local install="$1"
-    export PATH="$install/usr/bin:$BASE_PATH"
-    export LD_LIBRARY_PATH="$install/usr/lib:$install/usr/lib/wpeframework/plugins:$BASE_LD_LIBRARY_PATH"
+    local install="$1" new_path new_ld
+
+    # The leading elements are this run's own and are checked, not assumed: the suite binary and
+    # the plugin under test are loaded from them, so a group-writable install tree would be a
+    # way to substitute either.
+    loader_element_is_safe "$install/usr/bin" "this run's own PATH" \
+        || die "the install tree's binary directory is not usable as a search path:
+       $install/usr/bin
+       See the reason above.  The suite binary is loaded from there, so this run stops rather
+       than executing whatever is reachable instead."
+    loader_element_is_safe "$install/usr/lib" "this run's own LD_LIBRARY_PATH" \
+        || die "the install tree's library directory is not usable as a search path:
+       $install/usr/lib"
+    loader_element_is_safe "$install/usr/lib/wpeframework/plugins" "this run's own LD_LIBRARY_PATH" \
+        || die "the install tree's plugin directory is not usable as a search path:
+       $install/usr/lib/wpeframework/plugins
+       The plugin under test is loaded from there."
+
+    new_path="$(sanitise_search_path PATH "$BASE_PATH" "$install/usr/bin")"
+    new_ld="$(sanitise_search_path LD_LIBRARY_PATH "$BASE_LD_LIBRARY_PATH" \
+                  "$install/usr/lib" "$install/usr/lib/wpeframework/plugins")"
+
+    # An empty PATH would make every unqualified command in the run subshell fail in a way that
+    # looks like a missing tool rather than a rejected search path, so it is named here instead.
+    [ -n "$new_path" ] || die "no usable PATH element survived validation, so no command could be
+       resolved for the suite run.  The install tree's own bin directory is always the first
+       element, so this means it failed the check above."
+    [ -n "$new_ld" ] || die "no usable LD_LIBRARY_PATH element survived validation."
+
+    export PATH="$new_path"
+    export LD_LIBRARY_PATH="$new_ld"
 }
 
 # ------------------------------------------------------------------------------------
@@ -1648,14 +2070,39 @@ verify_results() { # $1=binary  $2=results path  $3=level
        binary still exits 0.  Refusing to attribute a coverage figure to a run that left no
        evidence it executed anything."
 
-    # The GoogleTest JSON header carries the run's totals; the first "tests" key is the top-level
-    # count.  sed rather than a JSON parser, so this script adds no dependency beyond the POSIX
-    # tools it already needs.
-    count="$(sed -n 's/^[[:space:]]*"tests"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$results" | head -1)"
-    if [ -z "$count" ] || [ "$count" -le 0 ]; then
-        die "$binary exited 0 but $results reports no tests (\"tests\": ${count:-absent}).
+    # THE COUNT THAT IS REPORTED IS THE COUNT THAT RAN.
+    #
+    # The GoogleTest JSON header carries the run's totals, and its "tests" field counts every case
+    # in the selection INCLUDING the DISABLED_ ones, which are listed as entries and never
+    # executed.  Reporting that field as "test case(s)" overstates any run that has a disabled
+    # case, and it is exactly the number a reader quotes as evidence -- so the executed count is
+    # derived here and the disabled count is named separately rather than folded into it.  Each
+    # field is taken from its first occurrence, which is the top-level header preceding the
+    # "testsuites" array.  sed rather than a JSON parser, so no dependency is added beyond the
+    # POSIX tools this script already needs.
+    local declared disabled failures errors
+    declared="$(sed -n 's/^[[:space:]]*"tests"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$results" | head -1)"
+    disabled="$(sed -n 's/^[[:space:]]*"disabled"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$results" | head -1)"
+    failures="$(sed -n 's/^[[:space:]]*"failures"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$results" | head -1)"
+    errors="$(sed -n 's/^[[:space:]]*"errors"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$results" | head -1)"
+    : "${disabled:=0}" "${failures:=0}" "${errors:=0}"
+    if [ -z "$declared" ] || [ "$declared" -le 0 ]; then
+        die "$binary exited 0 but $results reports no tests (\"tests\": ${declared:-absent}).
        An empty run cannot substantiate a coverage figure.  If a --gtest_filter reached the binary
        through the environment, it selected nothing."
+    fi
+    count=$((declared - disabled))
+    if [ "$count" -le 0 ]; then
+        die "$binary exited 0 and $results declares $declared case(s), but $disabled of them are
+       DISABLED_ and so none actually executed.  A coverage figure cannot be attributed to a run in
+       which nothing ran."
+    fi
+    # The results file is this run's evidence and a zero exit status is a different claim.  A suite
+    # that recorded a failure or an error while still exiting 0 must not have its coverage reported.
+    if [ "$failures" -ne 0 ] || [ "$errors" -ne 0 ]; then
+        die "$binary exited 0 but $results records $failures failure(s) and $errors error(s).
+       The results file is the evidence and it contradicts the exit status, so this run is treated
+       as a failing suite and no coverage is reported for it."
     fi
 
     grep -Eq "$EXPECTED_FIXTURE_PATTERN" "$results" || die "$binary exited 0 and $results reports
@@ -1665,7 +2112,12 @@ verify_results() { # $1=binary  $2=results path  $3=level
        plugin and then rebuild entservices-testframework against it (see
        '$(basename -- "$SCRIPT_PATH") --help-build')."
 
-    log "${level^^} results verified: $count test case(s) in $results, including $REPO_NAME fixtures"
+    if [ "$disabled" -gt 0 ]; then
+        log "${level^^} results verified: $count test case(s) EXECUTED per $results (of $declared
+       declared; $disabled DISABLED_ and therefore not run), including $REPO_NAME fixtures"
+    else
+        log "${level^^} results verified: $count test case(s) EXECUTED per $results, including $REPO_NAME fixtures"
+    fi
 }
 
 
@@ -1679,8 +2131,17 @@ suite_binary_for_level() {
 
 run_suite() {
     local level="$1"
-    local binary results_name results_path framework_results run_dir rc=0
+    local binary binary_path results_name results_path framework_results run_dir rc=0
     binary="$(suite_binary_for_level "$level")"
+    # EXECUTED BY ABSOLUTE PATH, not resolved through PATH.  validate_install_dir() has already
+    # proved this exact file exists and is executable, and the whole point of the search-path
+    # hygiene above is that nothing else should be able to answer to this name; naming the file
+    # outright removes the question entirely, including for the case where the install tree's own
+    # bin directory somehow stops being first.
+    binary_path="$LEVEL_INSTALL_DIR/usr/bin/$binary"
+    [ -x "$binary_path" ] || die "the ${level^^} suite binary is not executable at
+       $binary_path
+       validate_install_dir() checked it moments ago, so it has changed underneath this run."
     results_name="rdk${level^^}TestResults.json"
     results_path="$LEVEL_ARTIFACT_DIR/$results_name"
     assert_artifact_path_still_safe "$results_path"
@@ -1700,7 +2161,7 @@ run_suite() {
     framework_results="$run_dir/rdkL2TestResults.json"
 
     rule
-    log "running the ${level^^} suite: $binary"
+    log "running the ${level^^} suite: $binary_path"
     log "  working dir     = $run_dir  (so the framework's './install/...' paths resolve)"
     log "  PATH            = $PATH"
     log "  LD_LIBRARY_PATH = $LD_LIBRARY_PATH"
@@ -1742,6 +2203,29 @@ run_suite() {
     (
         cd -- "$run_dir" || exit 1
         export GTEST_OUTPUT="json:$results_path"
+        # SELECTION VARIABLES ARE NEUTRALISED, NOT INHERITED.
+        #
+        # GoogleTest reads its own options from the environment as well as from argv, and this
+        # script passes no selection arguments precisely so that the whole registered suite runs.
+        # An inherited GTEST_FILTER would silently narrow that: the suite would still exit 0, the
+        # results file would still be written, the fixture-name check would still pass because the
+        # surviving cases still belong to this plugin - and a gate verdict would then be published
+        # for a subset, with the failing cases simply absent.  GTEST_SHUFFLE and GTEST_REPEAT
+        # change what a figure means, GTEST_FAIL_FAST and GTEST_BREAK_ON_FAILURE truncate the run
+        # at the first failure, and GTEST_ALSO_RUN_DISABLED_TESTS adds cases the suite has
+        # deliberately withheld.  Every one of them is unset here so this run measures the suite as
+        # it stands.  Announced rather than done quietly, because a caller who set one deserves to
+        # know it was ignored.
+        local gtest_var
+        for gtest_var in GTEST_FILTER GTEST_SHUFFLE GTEST_RANDOM_SEED GTEST_REPEAT \
+                         GTEST_FAIL_FAST GTEST_BREAK_ON_FAILURE GTEST_ALSO_RUN_DISABLED_TESTS \
+                         GTEST_TOTAL_SHARDS GTEST_SHARD_INDEX; do
+            if [ -n "${!gtest_var:-}" ]; then
+                warn "ignoring inherited $gtest_var='${!gtest_var}': this run must execute the whole"
+                warn "    registered suite, because its verdict is a gate on the whole suite."
+            fi
+            unset "$gtest_var"
+        done
         if valgrind_enabled; then
             [ -n "$VALGRIND_BIN" ] || die "RUN_VALGRIND is set but valgrind is not on PATH."
             log "valgrind memcheck enabled with the options CI uses; it is NOT a gate"
@@ -1753,9 +2237,9 @@ run_suite() {
                 --show-reachable=yes \
                 --track-fds=yes \
                 --fair-sched=try \
-                "$binary"
+                "$binary_path"
         else
-            "$TIMEOUT_BIN" --foreground "${TIMEOUT_KILL_AFTER[@]}" "$suite_timeout" "$binary"
+            "$TIMEOUT_BIN" --foreground "${TIMEOUT_KILL_AFTER[@]}" "$suite_timeout" "$binary_path"
         fi
     ) || rc=$?
 
@@ -1791,6 +2275,12 @@ run_suite() {
        Check that the installed test library belongs to this plugin (see the provenance check
        above) and that no gtest filter selected an empty set."
     log "results archived: $results_path"
+    # The presence of the file is not the evidence -- its CONTENTS are.  verify_results() derives
+    # the executed count (declared minus DISABLED_), refuses a run whose results record a failure
+    # or an error despite a zero exit, and refuses one in which not a single case belongs to this
+    # plugin's fixtures.  Calling it here is what makes the count this script later prints an
+    # account of what ran rather than of what was registered.
+    verify_results "$binary" "$results_path" "$level"
 }
 
 # ------------------------------------------------------------------------------------
@@ -1983,6 +2473,100 @@ capture_coverage() {
 # ------------------------------------------------------------------------------------
 REPORT_BELOW_TARGETS=''
 REPORT_FLOOR_BREACHES=''
+
+# ------------------------------------------------------------------------------------
+# PROVENANCE.  Who produced these artifacts, from which tree, with which script.
+#
+# Coverage numbers are only evidence if they can be tied to a revision. Numbers with no
+# revision are indistinguishable from numbers produced by a different checkout, a different
+# runner body, or a different toolchain - and once separated from their tree they cannot be
+# re-attached, because nothing in an lcov trace records where it came from.
+#
+# Attribution is written three ways, deliberately redundantly:
+#   * provenance.txt, the full manifest, beside each level's traces;
+#   * the superproject's short SHA appended to the genhtml title, which puts it on EVERY page
+#     of the HTML report rather than in one file that can be separated from it;
+#   * a header block in the per-file report, so it stays self-describing when quoted alone.
+#
+# The runner's OWN sha256 is included because a trace can outlive the script that made it. If
+# the recorded hash does not match the script now on disk, the artifact was produced by a
+# different runner and its acceptance decision does not transfer.
+#
+# BOTH PLUGINS EMIT IDENTICALLY NAMED TEST LIBRARIES, so a trace that does not record which
+# plugin's build tree it came from is genuinely ambiguous here, not merely unattributed. The
+# manifest therefore records the level and the build directory alongside the revisions.
+# ------------------------------------------------------------------------------------
+git_sha_of() { # $1 = repository path;  prints "<sha> (<branch>)<dirty marker>" or "unavailable"
+    local repo="$1" sha branch dirty=''
+    command -v git >/dev/null 2>&1 || { printf 'unavailable (no git)\n'; return 0; }
+    git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { printf 'unavailable (not a repository)\n'; return 0; }
+    sha="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || sha=''
+    [ -n "$sha" ] || { printf 'unavailable (no HEAD)\n'; return 0; }
+    branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)" || branch='?'
+    # Tracked paths only: untracked build residue is not a content difference and must not be
+    # reported as one, or every instrumented tree would read as dirty.
+    if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+        dirty='  [DIRTY: tracked files modified]'
+    fi
+    printf '%s (%s)%s\n' "$sha" "$branch" "$dirty"
+}
+
+sha256_of() { # $1 = file;  prints the hex digest, or a reason
+    local f="$1"
+    [ -f "$f" ] || { printf 'absent\n'; return 0; }
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "$f" 2>/dev/null | awk '{print $1; exit}'
+    else
+        printf 'unavailable (no sha256sum)\n'
+    fi
+}
+
+write_provenance() { # $1 = level (l1|l2)
+    local level="$1"
+    PROVENANCE_TXT="$LEVEL_ARTIFACT_DIR/provenance.txt"
+
+    {
+        printf '%s %s coverage -- ARTIFACT PROVENANCE\n' "$REPO_NAME" "${level^^}"
+        printf '==============================================================\n\n'
+        printf 'Generated (UTC)      : %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf 'unavailable')"
+        printf 'Host                 : %s\n' "$(uname -n 2>/dev/null || printf 'unavailable')"
+        printf 'Clone index          : %s\n' "${CLONE_INDEX:-unset}"
+        printf 'Level                : %s\n' "${level^^}"
+        printf 'Workspace root       : %s\n' "$WS"
+        printf 'Repository root      : %s\n' "$REPO_ROOT"
+        printf 'Artifact directory   : %s\n' "$LEVEL_ARTIFACT_DIR"
+        printf '\nREVISIONS\n'
+        printf '  superproject       : %s\n' "$(git_sha_of "$WS")"
+        local sub
+        for sub in hdmicec entservices-hdmicecsource entservices-hdmicecsink entservices-testframework \
+                   entservices-apis entservices-helpers Thunder ThunderTools; do
+            if [ -d "$WS/$sub" ]; then
+                printf '  %-18s : %s\n' "$sub" "$(git_sha_of "$WS/$sub")"
+            fi
+        done
+        printf '\nRUNNER AND CONFIGURATION\n'
+        printf '  runner path        : %s\n' "$SCRIPT_PATH"
+        printf '  runner sha256      : %s\n' "$(sha256_of "$SCRIPT_PATH")"
+        printf '  runner bytes       : %s\n' "$(wc -c <"$SCRIPT_PATH" 2>/dev/null | tr -d ' ' || printf 'unavailable')"
+        printf '  lcov config        : %s\n' "$(sha256_of "$SCRIPT_DIR/L1Tests/.lcovrc_l1")"
+        printf '  line bar           : %s%%\n' "$COVERAGE_MIN"
+        printf '  branch data        : forced on (--rc branch_coverage=1)\n'
+        printf '\nTOOLCHAIN\n'
+        printf '  lcov               : %s\n' "$(lcov_run --version 2>/dev/null | head -n1 || printf 'unavailable')"
+        printf '  gcov               : %s\n' "$(gcov --version 2>/dev/null | head -n1 || printf 'unavailable')"
+        printf '  compiler           : %s\n' "$("${CXX:-g++}" --version 2>/dev/null | head -n1 || printf 'unavailable')"
+        printf '\nHOW TO CHECK THIS ARTIFACT STILL APPLIES\n'
+        printf '  1. Compare the superproject revision above with `git rev-parse HEAD`.\n'
+        printf '  2. Compare the runner sha256 above with `sha256sum %s`.\n' "$SCRIPT_PATH"
+        printf '  If either differs, these numbers were produced from a different tree or a\n'
+        printf '  different script, and the acceptance decision they carry does not transfer.\n'
+    } >"$PROVENANCE_TXT" || die "could not write $PROVENANCE_TXT"
+
+    chmod 600 -- "$PROVENANCE_TXT" 2>/dev/null || true
+    log "provenance: $PROVENANCE_TXT"
+    log "  superproject : $(git_sha_of "$WS")"
+    log "  runner sha256: $(sha256_of "$SCRIPT_PATH")"
+}
 
 per_file_report() {
     local level="$1"
@@ -2276,23 +2860,43 @@ gate_exempt_reason() {
             log "        that loads the plugin.  Saying 'uncoverable' unqualified would be false."
             ;;
         l2/plugin/HdmiCecSource.cpp)
-            log "        Reason: the plugin shell has a hard L2 ceiling of 40/53 = 75.5%.  Thirteen"
-            log "        lines are unreachable from the L2 execution model, each for a specific,"
-            log "        checked reason:"
-            log "          - Information() (2 lines): IPlugin::Information() is pure virtual at"
-            log "            Thunder/Source/plugins/IPlugin.h:97 and is called nowhere in Thunder"
-            log "            R4.4.1 -- only the Controller's own override exists."
-            log "          - the Root<> failure arm (3 lines): a live Thunder host resolves Root<>"
-            log "            against an installed, loadable implementation library; there is no L2"
-            log "            seam that makes it return null."
-            log "          - the out-of-process teardown block (7 lines): the implementation runs"
-            log "            IN-PROCESS at L2, so _connectionId is 0 and RemoteConnection(0) is null."
-            log "          - Deactivated()'s id-match Submit (1 line): connection ids start at 1 and"
-            log "            _connectionId is 0 in-process, so the comparison never holds."
+            log "        Reason: MEASURED at 33/53 = 62.3% under L2, with all 20 uncovered lines"
+            log "        enumerated below and grouped by what actually blocks each one.  Sixteen are"
+            log "        unreachable from the L2 execution model; four are reachable but would not"
+            log "        lift the file over the bar, and are stated as such rather than dressed up as"
+            log "        impossible:"
+            log "          - the out-of-process teardown block (7 lines: 129, 131, 133-136, 138)."
+            log "            Initialize() obtains the implementation with _service->Root<>(), and at"
+            log "            L2 that resolves IN-PROCESS, so _connectionId stays 0 and"
+            log "            _service->RemoteConnection(0) returns null -- Terminate(), its catch arm"
+            log "            and Release() are dead by construction.  Corroborated by the run itself:"
+            log "            'Failed to terminate connection' appears zero times in the suite log."
+            log "          - Deactivated(RPC::IRemoteConnection*) (4 lines: 154, 156, 159, 161)."
+            log "            Thunder invokes this only when an out-of-process connection dies, and"
+            log "            the id-match cannot hold anyway: connection ids start at 1 while"
+            log "            _connectionId is 0 in-process.  All four instrumented lines of the"
+            log "            function are therefore unreached, not just the Submit call."
+            log "          - the Root<> failure arm (3 lines: 87, 88, 93).  A live Thunder host"
+            log "            resolves Root<> against an installed, loadable implementation library;"
+            log "            there is no L2 seam that makes it return null, and manufacturing one"
+            log "            would be a production change."
+            log "          - Information() (2 lines: 149, 151).  IPlugin::Information() is pure"
+            log "            virtual at Thunder/Source/plugins/IPlugin.h:97 and is called nowhere in"
+            log "            Thunder R4.4.1 -- only the Controller's own override exists, so no L2"
+            log "            client can invoke it."
+            log "          - the non-STB profile rejection (4 lines: 61, 62, 112, 113).  These are"
+            log "            REACHABLE at L2 and are not claimed otherwise: a test could deactivate"
+            log "            the plugin, rewrite the host-global /etc/device.properties to a non-STB"
+            log "            profile and reactivate, which is precisely what the sink repository's"
+            log "            PluginRefusesToActivateUnderANonSinkProfile does.  They are left"
+            log "            uncovered deliberately, because covering them yields 37/53 = 69.8% --"
+            log "            still short of 80% -- so it would not change this verdict, while the"
+            log "            same four lines are already covered at L1."
             log "        This repository's own L1 suite measures the SAME file at 53/53 = 100%, so the"
-            log "        file is fully tested -- it is this level that cannot reach those lines.  No"
-            log "        exclusion glob was added and COVERAGE_MIN was not lowered; reaching them at"
-            log "        L2 would need an out-of-process host or a production change, both out of scope."
+            log "        TARGET meets the specification-section-0.9.2 bar; what is below the bar is"
+            log "        this one LEVEL's view of it.  No exclusion glob was added and COVERAGE_MIN"
+            log "        was not lowered -- the file stays in the denominator and its real 62.3% is"
+            log "        printed above."
             ;;
         *)
             warn "no documented reason is recorded for the exemption '$path' at ${level^^}."
@@ -2383,6 +2987,25 @@ apply_gate() {
        Artifacts for inspection: $LEVEL_ARTIFACT_DIR"
     fi
 
+    # A BREACHED FLOOR IS A MEASURED REGRESSION, SO IT CANNOT BE FOLLOWED BY AN ACCEPTANCE.
+    #
+    # The >= bar and the must-not-regress floors answer different questions: the bar asks "is this
+    # file tested enough", the floor asks "did this file just lose coverage it already had".  A
+    # file sliding from 98% to 85% clears the bar and is exactly the regression the floor language
+    # in specification section 0.9.4 exists to catch - "a floor, not a target to descend to".
+    # Printing "COVERAGE GATE PASSED", exiting 0, and adding a warning underneath leaves the
+    # regression to be noticed by a human reading a log; the exit status, which is what CI acts on,
+    # says the run was fine.  The breach is therefore recorded as an advisory reason BEFORE the
+    # verdict is decided, so the run exits 3 and no caller can read it as an acceptance.
+    if [ -n "$REPORT_FLOOR_BREACHES" ]; then
+        note_advisory "a must-not-regress floor was BREACHED at ${level^^} (each breached file is
+       listed above with its current figure and its recorded floor).  The >= ${COVERAGE_MIN}% bar was
+       still met, so this is not a gate failure - it is coverage that existed being lost as tests
+       were added elsewhere, which specification section 0.9.4 forbids accepting silently.
+       Investigate the breach, or re-record the floor deliberately if the loss is intended and
+       justified."
+    fi
+
     rule
     if [ -n "$ADVISORY_REASONS" ]; then
         warn "LEVEL ${level^^}: COVERAGE ADVISORY -- the figures meet the ${COVERAGE_MIN}% bar, but THIS IS"
@@ -2393,12 +3016,13 @@ apply_gate() {
         warn "                 them.  Exit status $EXIT_ADVISORY marks that difference."
         exit "$EXIT_ADVISORY"
     fi
+    # Reached only when nothing weakened the run: the bar was 80, the suite was green, the
+    # aggregate and every non-exempt target cleared it, no floor was breached, and no override
+    # suppressed a check.  A floor breach cannot reach this line - it is recorded as an advisory
+    # reason above and exits before here - so there is no "passed, but" verdict left to print.
     log "LEVEL ${level^^}: COVERAGE GATE PASSED -- suite green, aggregate and every target at or"
-    log "                 above ${COVERAGE_MIN}% lines (bar: ${COVERAGE_MIN}%)"
-    if [ -n "$REPORT_FLOOR_BREACHES" ]; then
-        warn "...but a must-not-regress floor was breached (listed above).  The gate passed; the"
-        warn "   regression is still real and should not be accepted silently."
-    fi
+    log "                 above ${COVERAGE_MIN}% lines (bar: ${COVERAGE_MIN}%), every"
+    log "                 must-not-regress floor held, and no check was overridden"
 }
 
 
@@ -2444,11 +3068,9 @@ run_level() {
     rule
     log "================ LEVEL ${level^^} ================"
 
-    # No per-level re-check is needed any more.  This used to re-run the home-configuration
-    # stash here, because a ~/.lcovrc recreated between levels would otherwise apply to the
-    # second one -- and the early return on "already stashed" made that re-check a no-op
-    # anyway.  With a private HOME there is nothing to re-check: no file the caller or a
-    # sibling run can create is reachable from it.
+    # No per-level re-check of the home configuration is needed: the private HOME is created
+    # once at start-up and no file the caller or a sibling run can create is reachable from it,
+    # so a ~/.lcovrc appearing between levels cannot apply to the second one.
     resolve_level_inputs "$level"
     resolve_lcov_config "$level"
 
@@ -2462,6 +3084,17 @@ run_level() {
 
     # First filesystem write of the run, and only now that every prerequisite has passed.
     create_level_artifact_dir "$level"
+
+    # PROVENANCE FIRST, before anything is captured. Two reasons it goes here rather than at the
+    # end: it augments the genhtml title, which is what puts the revision on every page of the
+    # report; and a run that dies later still leaves behind a manifest saying which tree it was
+    # attempting to measure, which is more useful than a directory of unattributed fragments.
+    write_provenance "$level"
+    if [ "$GENHTML_TITLE" = "$REPO_NAME coverage" ]; then
+        local __short
+        __short="$(git -C "$WS" rev-parse --short=12 HEAD 2>/dev/null)" || __short=''
+        GENHTML_TITLE="$REPO_NAME coverage @ ${__short:-revision-unavailable}"
+    fi
 
     setup_runtime_env "$LEVEL_INSTALL_DIR"
 
@@ -2567,9 +3200,15 @@ print_artifact_summary() {
 }
 
 main() {
+    # THE REFERENCE AUDIT RUNS FIRST, before parsing, before validation and before any
+    # filesystem write.  A script that cannot resolve one of its own function or variable
+    # names must say so and stop, not discover it mid-run after the banner has printed.
+    reference_audit
+
     case "${1:-}" in
         -h|--help)     usage; exit 0 ;;
         --help-build)  print_build_recipe; exit 0 ;;
+        selftest)      selftest; exit 0 ;;
     esac
 
     if [ "$#" -gt 1 ]; then

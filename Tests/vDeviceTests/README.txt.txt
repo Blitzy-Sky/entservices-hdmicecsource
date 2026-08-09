@@ -58,11 +58,24 @@ NOT EXECUTED. Runtime validation is deferred.
 
 Everything above this line is an instruction for someone who HAS a device; it is not a record
 of a run. This suite has not been executed - on a device, on an emulator, or anywhere else -
-and no result from it is reported anywhere. The suite itself pre-dates the current test-coverage
-pass, which changed nothing in it but the name of the entry-point script referenced in this file
-and in the test-case docstrings: the module on disk is SuitManager.py, while this README and all
-33 docstrings previously said suiteManager.py, so the documented command failed on a
-case-sensitive filesystem. No test logic was altered, and no case was run.
+and no result from it is reported anywhere.
+
+The entry point is SuitManager.py, spelled exactly that way. This file and all 33 test-case
+docstrings reference that spelling, and they have to: a case-sensitive filesystem rejects any
+other, so a command written with a different case fails before anything runs. The HDMI CEC Sink
+suite uses the same filename for the same reason, which keeps the two device-level suites
+symmetric.
+
+No test logic in this suite has been altered. Everything changed here is documentation - this
+file, the module docstrings and the 33 case docstrings - and each case's executable body is
+exactly what it was.
+
+One stale reference to that name REMAINS, deliberately, and is recorded here rather than
+corrected: the @dependencies block of Init_Devicelist_Populate.py in this directory still reads
+suiteManager.py. That module is outside the frozen scope of the coverage pass - which admits only
+this README and the 33 files under Testcases/ in this directory - so the reference is reported
+instead of edited. It is a documentation-only inaccuracy: nothing imports a module by that name,
+so no execution path depends on it, and the correct invocation is the one printed above.
 
 The device under test is the source: a set-top box, which takes a CEC playback/tuner logical
 address beneath the television. The virtual CEC peers this suite configures sit around it. The
@@ -78,6 +91,10 @@ Static validation applied to the suite:
   registered, 33 on disk, no discrepancy either way.
 - YAML well-formedness parsing of every document under vcomponent_configurations/: 79
   documents, none malformed.
+- A docstring-header check over all 33 case modules: each carries the nine documentation tags
+  this suite uses (@file, @brief, @testcase, @details, @precondition, @dependencies,
+  @expected_result, @pass_criteria, @failure_criteria), each @file and @testcase matches the
+  module's own filename, and each module exposes a run_test() at module level.
 
 Prerequisites that were not available, and so were not used:
 - A QEMU target.
