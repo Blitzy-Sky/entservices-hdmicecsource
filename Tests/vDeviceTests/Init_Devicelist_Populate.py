@@ -13,7 +13,7 @@
  * @dependencies
  *  - utils.py
  *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
+ *  - SuitManager.py
  *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
@@ -200,7 +200,7 @@ def run_test():
     if not activate_plugin("org.rdk.HdmiCecSource"):
         log_error(f"Init_Devicelist_Populate Failed ❌: plugin activation failed (org.rdk.HdmiCecSource)")
         return False
-    # Align with suiteManager startup guard to let CEC threads fully initialize.
+    # Align with the SuitManager startup guard to let CEC threads fully initialize.
     time.sleep(6)
 
     # ── Step 1: configure ────────────────────────────────────────────────────

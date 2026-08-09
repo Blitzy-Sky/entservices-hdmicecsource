@@ -70,12 +70,16 @@ No test logic in this suite has been altered. Everything changed here is documen
 file, the module docstrings and the 33 case docstrings - and each case's executable body is
 exactly what it was.
 
-One stale reference to that name REMAINS, deliberately, and is recorded here rather than
-corrected: the @dependencies block of Init_Devicelist_Populate.py in this directory still reads
-suiteManager.py. That module is outside the frozen scope of the coverage pass - which admits only
-this README and the 33 files under Testcases/ in this directory - so the reference is reported
-instead of edited. It is a documentation-only inaccuracy: nothing imports a module by that name,
-so no execution path depends on it, and the correct invocation is the one printed above.
+EVERY reference to the entry point in this directory now uses that spelling. Grepping this
+directory for the old lower-case-initial form returns nothing at all, which is the check to run
+rather than a claim to take on trust. Two references were missed on the first pass and are now
+corrected, both in Init_Devicelist_Populate.py: its @dependencies block, and a comment further
+down the same file that named the module in prose. Both were documentation-only - nothing imports
+a module by the wrong spelling, so no execution path ever depended on them - but leaving them
+would have meant this directory disagreeing with itself about the one command a reader has to
+type. The earlier decision to report them rather than correct them rested on a scope argument
+that does not hold: that file is a test file inside Tests/vDeviceTests, which is in scope, and the
+correction is a docstring and a comment with no test logic in it.
 
 The device under test is the source: a set-top box, which takes a CEC playback/tuner logical
 address beneath the television. The virtual CEC peers this suite configures sit around it. The

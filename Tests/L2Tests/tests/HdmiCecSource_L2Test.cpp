@@ -33,6 +33,8 @@
 // "absent" from "unreadable".
 #include <cerrno>
 #include <cstdio>
+// For the COM-RPC endpoint override read in ComRpcEndpoint() below.
+#include <cstdlib>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <mutex>
@@ -66,6 +68,49 @@ using IHdmiCecSourceDeviceListIterator = WPEFramework::Exchange::IHdmiCecSource:
 using PowerState = WPEFramework::Exchange::IPowerManager::PowerState;
 
 namespace {
+/*
+ * COM-RPC acquisition bounds, named rather than written as literals at the call site so each value
+ * has one place to change and one recorded reason. Durations in milliseconds, and identical to the
+ * set in the sibling entservices-hdmicecsink L2 suite so the two express this the same way.
+ *
+ *  - kComRpcOpenAttemptMs   the per-attempt budget handed to Open(). Unchanged from the literal that
+ *                           preceded it, so a first attempt behaves exactly as it always did.
+ *  - kComRpcOpenTimeoutMs   the total window across retries. One 3 s attempt is enough on an idle
+ *                           host but not on a loaded one, and not while the endpoint below is
+ *                           momentarily owned by another process.
+ *  - kComRpcRetryIntervalMs the pause between attempts.
+ *  - kComRpcCloseTimeoutMs  the bounded close applied to a client before it is released.
+ */
+const uint32_t kComRpcOpenAttemptMs = 3000;
+const uint32_t kComRpcOpenTimeoutMs = 20000;
+const uint32_t kComRpcRetryIntervalMs = 250;
+const uint32_t kComRpcCloseTimeoutMs = 2000;
+
+/*
+ * The filesystem path of the COM-RPC endpoint this suite connects to.
+ *
+ * The path is host-global: every Thunder host on the machine binds the same name, so two L2 runs on
+ * one host connect through the same socket. That is not theoretical here - running this suite while a
+ * sibling process owned /tmp/communicator produced six failures at "Failed to get HdmiCecSource
+ * Plugin Interface" against a plugin the same log recorded as successfully activated, and the whole
+ * suite passed when the run was given a private /tmp. So the value is read from the environment
+ * instead of being compiled in.
+ *
+ * The default is the path the framework's own controller uses, so behaviour with no override set is
+ * byte-for-byte what it was. The override is deliberately only half of the story: the host side of
+ * the socket is bound by entservices-testframework (Tests/L2Tests/L2testController.cpp and the mock
+ * proxies), which AAP section 0.10.2 places out of scope for edits, so pointing this suite elsewhere
+ * requires the operator to point the host there too. The bounded retry above is the half that removes
+ * the false failures in the default configuration.
+ */
+std::string ComRpcEndpoint()
+{
+    const char* const endpointOverride = ::getenv("L2TEST_COMRPC_PATH");
+    return ((endpointOverride != nullptr) && (endpointOverride[0] != '\0'))
+        ? std::string(endpointOverride)
+        : std::string("/tmp/communicator");
+}
+
     static void removeFile(const char* fileName)
 	{
 		if (std::remove(fileName) != 0)
@@ -1411,7 +1456,12 @@ HdmiCecSource_L2Test::~HdmiCecSource_L2Test()
     status = DeactivateService("org.rdk.PowerManager");
     EXPECT_EQ(Core::ERROR_NONE, status);
 
+    // The channel is handed back explicitly rather than left to lapse when the proxy is destroyed.
+    // The endpoint is host-global (see ComRpcEndpoint), so a client that is released without being
+    // closed leaves a connection for the next run to contend with; the close is bounded so teardown
+    // cannot stall on it.
     if (HdmiCecSource_Client.IsValid()) {
+        HdmiCecSource_Client->Close(kComRpcCloseTimeoutMs);
         HdmiCecSource_Client.Release();
     }
 
@@ -1427,14 +1477,37 @@ HdmiCecSource_L2Test::~HdmiCecSource_L2Test()
     TEST_LOG("HdmiCecSource_L2Test cleanup complete");
 }
 
+/*
+ * Acquire the source plugin over COM-RPC, reporting success only for a usable acquisition.
+ *
+ * Requiring BOTH the shell and the interface is pre-existing behaviour and correct: it is the contract
+ * the sink suite's helper has now been brought into line with. What is added here is the bounded retry.
+ *
+ * The endpoint is host-global (see ComRpcEndpoint above), so a single attempt can lose to a process
+ * that momentarily owns the socket, and a loaded host can miss a 3 s attempt against a plugin that is
+ * perfectly healthy. Both were observed on this host: six cases in one run failed at "Failed to get
+ * HdmiCecSource Plugin Interface" while the same log recorded the plugin as activated, and every one of
+ * them passed on its own. Retrying inside kComRpcOpenTimeoutMs turns that into a slower success;
+ * keeping the bound means a genuinely absent plugin still fails the caller rather than hanging the
+ * suite. A shell acquired without its interface is handed back before the next attempt, so a failed
+ * acquisition leaves no reference behind either.
+ */
 uint32_t HdmiCecSource_L2Test::CreateHdmiCecSourceInterfaceObject()
 {
     uint32_t return_value = Core::ERROR_GENERAL;
 
+    // A test may acquire more than once. Hand the previous channel back before opening another,
+    // rather than letting it lapse when the proxy is overwritten: the endpoint is shared, so a
+    // channel nobody closes is a channel every other run has to work around.
+    if (HdmiCecSource_Client.IsValid()) {
+        HdmiCecSource_Client->Close(kComRpcCloseTimeoutMs);
+        HdmiCecSource_Client.Release();
+    }
+
     TEST_LOG("Creating HdmiCecSource_Engine");
     HdmiCecSource_Engine = Core::ProxyType<RPC::InvokeServerType<1, 0, 4>>::Create();
     HdmiCecSource_Client = Core::ProxyType<RPC::CommunicatorClient>::Create(
-        Core::NodeId("/tmp/communicator"),
+        Core::NodeId(ComRpcEndpoint().c_str()),
         Core::ProxyType<Core::IIPCServer>(HdmiCecSource_Engine));
 
     TEST_LOG("Creating HdmiCecSource_Engine Announcements");
@@ -1445,19 +1518,32 @@ uint32_t HdmiCecSource_L2Test::CreateHdmiCecSourceInterfaceObject()
     if (!HdmiCecSource_Client.IsValid()) {
         TEST_LOG("Invalid HdmiCecSource_Client");
     } else {
-        m_controller_cecSource = HdmiCecSource_Client->Open<PluginHost::IShell>(
-            _T("org.rdk.HdmiCecSource"), ~0, 3000);
-        if (m_controller_cecSource) {
-            m_cecSourcePlugin = m_controller_cecSource->QueryInterface<Exchange::IHdmiCecSource>();
-            if (m_cecSourcePlugin) {
-                m_cecSourcePlugin->Register(&m_notificationHandler);
-                return_value = Core::ERROR_NONE;
-                TEST_LOG("Successfully created HdmiCecSource Plugin Interface");
-            } else {
+        const auto deadline
+            = std::chrono::steady_clock::now() + std::chrono::milliseconds(kComRpcOpenTimeoutMs);
+
+        for (;;) {
+            m_controller_cecSource = HdmiCecSource_Client->Open<PluginHost::IShell>(
+                _T("org.rdk.HdmiCecSource"), ~0, kComRpcOpenAttemptMs);
+            if (m_controller_cecSource) {
+                m_cecSourcePlugin = m_controller_cecSource->QueryInterface<Exchange::IHdmiCecSource>();
+                if (m_cecSourcePlugin) {
+                    m_cecSourcePlugin->Register(&m_notificationHandler);
+                    return_value = Core::ERROR_NONE;
+                    TEST_LOG("Successfully created HdmiCecSource Plugin Interface");
+                    break;
+                }
+
                 TEST_LOG("Failed to get IHdmiCecSource interface");
+                m_controller_cecSource->Release();
+                m_controller_cecSource = nullptr;
+            } else {
+                TEST_LOG("Failed to get HdmiCecSource Plugin Interface");
             }
-        } else {
-            TEST_LOG("Failed to get HdmiCecSource Plugin Interface");
+
+            if (std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(kComRpcRetryIntervalMs));
         }
     }
     return return_value;
@@ -4975,7 +5061,7 @@ TEST_F(HdmiCecSource_L2Test, PowerModeTransitionsReachTheImplementation)
         = Core::ProxyType<RPC::InvokeServerType<1, 0, 4>>::Create();
     Core::ProxyType<RPC::CommunicatorClient> powerClient
         = Core::ProxyType<RPC::CommunicatorClient>::Create(
-            Core::NodeId("/tmp/communicator"), Core::ProxyType<Core::IIPCServer>(powerEngine));
+            Core::NodeId(ComRpcEndpoint().c_str()), Core::ProxyType<Core::IIPCServer>(powerEngine));
 #if ((THUNDER_VERSION == 2) || ((THUNDER_VERSION == 4) && (THUNDER_VERSION_MINOR == 2)))
     powerEngine->Announcements(powerClient->Announcement());
 #endif

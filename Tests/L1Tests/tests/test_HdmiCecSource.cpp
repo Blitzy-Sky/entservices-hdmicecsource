@@ -152,6 +152,26 @@ namespace
     // instead of reading an arbitrary amount of it into this process.
     static const std::string::size_type kMaxSnapshotBytes = 1024u * 1024u;
 
+    // The profile file entservices-helpers' searchRdkProfile() reads, and which both
+    // HdmiCecSource::Initialize and HdmiCecSource::Deinitialize consult before doing anything.
+    // Named once here for the guard below; the existing helpers and fixtures that predate it keep
+    // their literal, because rewriting a passing fixture to use a constant is churn, not a fix.
+    static const char* const kDevicePropertiesFile = "/etc/device.properties";
+
+    // The profile the source plugin requires: HdmiCecSource::Initialize returns "Not supported"
+    // for anything else, and Deinitialize returns early without stopping its worker threads.
+    static const char* const kSourceProfileContents = "RDK_PROFILE=STB\n";
+
+    // The one diagnostic every test that builds a ScopedLifecycleFiles skips with, held in one
+    // place so the eleven sites cannot drift apart.  Stated as "not measured", because that is
+    // precisely what a refused custody lock means: the guard snapshotted nothing, provisioned
+    // nothing and will restore nothing, so the body has no precondition to run against.
+    static const char* const kLifecycleCustodyRefused =
+        "custody of /etc/device.properties and/or " CEC_SETTING_ENABLED_FILE " is held by another "
+        "run on this host, so this test's guard deliberately touched neither file and there is no "
+        "provisioned state to test against.  Nothing was measured and nothing was changed - this "
+        "is a SKIP, not a failure.  Re-run when the .l1test.lock files beside those paths are free.";
+
     /*
      * Custody of a host-global path, held for as long as an object needs it.
      *
@@ -781,6 +801,25 @@ namespace
             return m_devicePropertiesSnapshotCaptured && m_cecSettingsSnapshotCaptured && m_devicePropertiesProvisioned && m_cecSettingsProvisioned;
         }
 
+        /*
+         * Whether custody of BOTH managed paths was granted - which is what separates "this test
+         * was not run" from "this test found something wrong".
+         *
+         * Exposed because the two are opposite verdicts.  When the lock is held by another run on
+         * this shared host, this guard deliberately touches NOTHING: no snapshot, no provisioning,
+         * no restore.  Nothing was tested, so a FAILURE would be a false red attributed to a test
+         * that never executed its own precondition - and that is exactly what was measured, 24
+         * "could not take custody" reports turning into red cases across six runs while sibling
+         * checkouts held the lock.  A skip says "not measured", which is the truth.
+         *
+         * IsValid() is still the assertion to make afterwards: with custody granted, a failed
+         * snapshot or a failed write IS a defect and must stay a failure.
+         */
+        bool CustodyHeld() const
+        {
+            return m_devicePropertiesCustody.Held() && m_cecSettingsCustody.Held();
+        }
+
         // Returns true only when both files are back to their captured state. A failure
         // leaves m_restored false so the destructor retries; the directory is cleaned up
         // and reported separately, because a leftover empty directory is a different
@@ -950,6 +989,14 @@ namespace
         // starting state.  Tests that care about which loadSettings() arm ran assert on it.
         bool IsPrepared() const { return m_captured && m_prepared; }
 
+        // Whether custody was granted, which is what separates "this test was not run" from
+        // "this test found something wrong".  Without custody this guard touches NOTHING - no
+        // snapshot, no clear, no restore - so a test that depends on the cleared state has no
+        // precondition to run against and must report SKIPPED rather than a failure it did not
+        // actually observe.  With custody granted, a failed capture or clear IS a defect and
+        // stays a failure.  Same reasoning as ScopedLifecycleFiles::CustodyHeld.
+        bool CustodyHeld() const { return m_custody.Held(); }
+
         bool WasPresentOnTheHost() const { return m_wasPresent; }
 
     private:
@@ -967,6 +1014,121 @@ namespace
         bool m_directoryCreated;
         std::string m_directoryPath;
         bool m_prepared;
+    };
+
+    /*
+     * Custody of /etc/device.properties for the WHOLE LIFETIME of a fixture, with the host's own
+     * file captured on the way in and put back on the way out.
+     *
+     * WHY THIS EXISTS AND WHY IT IS A MEMBER RATHER THAN SetUp()/TearDown().
+     * HdmiCecSourceInitializedTest provisions the profile in its CONSTRUCTOR - it has to, because
+     * plugin->Initialize() runs there and refuses to activate without RDK_PROFILE=STB - and it
+     * used to delete the file unconditionally in its DESTRUCTOR.  A constructor runs BEFORE
+     * SetUp() and a destructor runs AFTER TearDown(), so a SetUp()/TearDown() pair cannot bracket
+     * either one: SetUp() would capture a file the constructor had already replaced, and
+     * TearDown() would restore a file the destructor then deleted again.  Measured before this
+     * guard existed: after `RdkServicesL1Test --gtest_filter='HdmiCecSourceInitializedTest.*'`,
+     * /etc/device.properties was ABSENT - a host-global file removed by a test run, which the
+     * next suite (and the sink plugin's suite, and anything else on the machine that reads the
+     * profile) then finds missing.
+     *
+     * A MEMBER OF THE DERIVED FIXTURE IS EXACTLY THE RIGHT WINDOW.  Members are constructed after
+     * the base subobject and before the derived constructor's body, and destroyed after the
+     * derived destructor's body has run.  So this captures the file the fixture inherited, before
+     * the constructor provisions anything, and restores it after the destructor has finished with
+     * it - which also covers HdmiCecSourceInitializedEventTest, because that fixture derives from
+     * this one and its own destructor body runs earlier still.
+     *
+     * CUSTODY IS TAKEN FIRST AND HELD THROUGHOUT, not per write.  The window being protected is
+     * "capture, provision, run every case, restore", and the test bodies inside it delete and
+     * recreate this path themselves.  A lock taken per write would leave those gaps unguarded and
+     * the restore could then put a stale snapshot over another writer's update.  The lock is
+     * reference-counted per path inside the process, so the nested acquisitions inside
+     * writeFile()/restoreFile(), and the ScopedLifecycleFiles guards built inside individual test
+     * bodies, are increments rather than deadlocks.  It is NOT fail-open: without custody nothing
+     * is captured, Provision() refuses, and the host is left entirely to its owner.
+     */
+    class ScopedDevicePropertiesFile {
+    public:
+        ScopedDevicePropertiesFile()
+            : m_custody(kDevicePropertiesFile)
+            , m_wasPresent(false)
+            , m_contents()
+            , m_mode(0)
+            , m_uid(static_cast<uid_t>(-1))
+            , m_gid(static_cast<gid_t>(-1))
+            , m_captured(m_custody.Held()
+                  && readFile(kDevicePropertiesFile, m_wasPresent, m_contents, m_mode, &m_uid, &m_gid))
+        {
+            if (!m_custody.Held()) {
+                printf("ScopedDevicePropertiesFile: custody of %s could not be acquired, so it was "
+                       "neither snapshotted nor provisioned and the host is untouched.  "
+                       "Captured() reports false.\n",
+                    kDevicePropertiesFile);
+            }
+        }
+
+        ScopedDevicePropertiesFile(const ScopedDevicePropertiesFile&) = delete;
+        ScopedDevicePropertiesFile& operator=(const ScopedDevicePropertiesFile&) = delete;
+
+        // A destructor cannot throw, so a failed restore is reported as the test's verdict and
+        // the remaining work is still attempted rather than abandoned at the first error.
+        ~ScopedDevicePropertiesFile()
+        {
+            // Only what was captured is restored.  Without this guard an uncaptured snapshot would
+            // read as "the file was absent" and the restore would DELETE a host file this fixture
+            // never read - the very failure mode this class was written to end.
+            if (m_captured
+                && !restoreFile(kDevicePropertiesFile, m_wasPresent, m_contents, m_mode, m_uid, m_gid)) {
+                ADD_FAILURE() << "ScopedDevicePropertiesFile: " << kDevicePropertiesFile
+                              << " could not be restored to the state this fixture found; see the "
+                                 "diagnostics above.  The host is left modified and the next suite "
+                                 "will read the wrong profile.";
+            }
+        }
+
+        // True when custody was granted AND the host's own state was snapshotted, which together
+        // are the precondition for provisioning and for restoring.
+        bool Captured() const { return m_captured; }
+
+        bool WasPresentOnTheHost() const { return m_wasPresent; }
+
+        /*
+         * Put the profile this fixture needs on the path, atomically and under the custody this
+         * object already holds.
+         *
+         * Called twice by HdmiCecSourceInitializedTest: once before Initialize(), and once more
+         * immediately before Deinitialize().  The second call is not redundant.
+         * HdmiCecSource::Deinitialize re-reads the profile through searchRdkProfile() and RETURNS
+         * EARLY when it is not STB, skipping the teardown that stops the plugin's OSD/discovery
+         * thread - and that thread then goes on calling Connection::sendTo on a CEC mock the
+         * fixture has already released, which segfaults the test binary instead of failing it.
+         * Re-stating the profile immediately before the call closes that window whatever else on
+         * this shared host wrote the file while the test was running.
+         *
+         * No mode is passed, so the value is written under whatever permissions the path already
+         * carries; the captured mode and owner are reasserted only by the restore, which is the
+         * one place they have to be.
+         */
+        bool Provision(const std::string& contents) const
+        {
+            if (!m_captured) {
+                return false;
+            }
+            return writeFile(kDevicePropertiesFile, contents);
+        }
+
+    private:
+        // FIRST MEMBER: declaration order is the lifetime of the custody window.
+        PathCustodyLock m_custody;
+        bool m_wasPresent;
+        std::string m_contents;
+        // Declared before m_captured on purpose: m_captured is initialised by the readFile() call
+        // that fills these, and members initialise in declaration order.
+        mode_t m_mode;
+        uid_t m_uid;
+        gid_t m_gid;
+        bool m_captured;
     };
 
     // Local stack-safe connection double used to drive the private remote-connection notification sink.
@@ -1498,14 +1660,33 @@ protected:
 
 class HdmiCecSourceInitializedTest : public HdmiCecSourceTest {
 protected:
+    // FIRST member of this fixture, deliberately.  It is constructed after the base subobject and
+    // before the constructor body below, and destroyed after the destructor body above has
+    // finished - which is the only window that brackets BOTH the provisioning this fixture does
+    // in its constructor and the plugin teardown it does in its destructor.  See
+    // ScopedDevicePropertiesFile for the measurement that made it necessary: without it this
+    // fixture left /etc/device.properties ABSENT on the host, and its derived
+    // HdmiCecSourceInitializedEventTest did the same.
+    ScopedDevicePropertiesFile devicePropertiesCustody;
+
     HdmiCecSourceInitializedTest()
         : HdmiCecSourceTest()
+        , devicePropertiesCustody()
     {
-        system("ls -lh /etc/");
-        removeFile("/etc/device.properties");
-        system("ls -lh /etc/");
-        createFile("/etc/device.properties", "RDK_PROFILE=STB");
-        system("ls -lh /etc/");
+        // The profile goes on through the guard that captured the host's own file, so the same
+        // object that provisions it is the one that puts the host's value back.  The bytes are
+        // exactly what the previous removeFile()/createFile() pair wrote ("RDK_PROFILE=STB\n"),
+        // so the plugin sees precisely the file it saw before - the difference is that the
+        // host's file is now borrowed rather than destroyed.
+        //
+        // Not fatal on failure: a fixture that could not take custody must not silently proceed
+        // to assert on an Initialize() whose outcome then depends on another writer's file, and
+        // the message says which of the two happened.
+        EXPECT_TRUE(devicePropertiesCustody.Provision(kSourceProfileContents))
+            << "could not provision " << kDevicePropertiesFile << " with the STB profile this "
+               "fixture requires (custody "
+            << (devicePropertiesCustody.Captured() ? "held, write failed" : "not granted")
+            << "), so plugin->Initialize() below is reading whatever is on the host";
         EXPECT_EQ(string(""), plugin->Initialize(&service));
         EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("setEnabled"), _T("{\"enabled\": true}"), response));
         EXPECT_EQ(response, string("{\"success\":true}"));
@@ -1519,9 +1700,54 @@ protected:
                 }
             EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("setEnabled"), _T("{\"enabled\": false}"), response));
             EXPECT_EQ(response, string("{\"success\":true}"));
+
+            // Re-state the profile immediately before Deinitialize, because Deinitialize READS IT
+            // AGAIN and its behaviour turns on the answer: HdmiCecSource::Deinitialize calls
+            // searchRdkProfile() and returns early for anything that is not STB, skipping the
+            // teardown that stops this plugin's OSD/discovery thread.  That thread then keeps
+            // calling Connection::sendTo through a CEC mock the base fixture is about to delete,
+            // and the mock's guard is a NON-FATAL EXPECT_NE followed by an unconditional
+            // dereference - so the binary SEGFAULTS instead of failing a test.  Any writer on this
+            // shared host (the sink plugin's suite provisions the same path with RDK_PROFILE=TV)
+            // can put the file into that state while this fixture's cases are running, and only a
+            // re-statement at this point closes the window.  Under the custody this guard holds,
+            // cooperating writers wait rather than interleave.
+            EXPECT_TRUE(devicePropertiesCustody.Provision(kSourceProfileContents))
+                << "could not re-state the STB profile before Deinitialize; if the profile on the "
+                   "host is not STB, Deinitialize will return early and leave this plugin's "
+                   "worker thread running past the release of the CEC mock";
+
             plugin->Deinitialize(&service);
-	    removeFile("/etc/device.properties");
-	    
+
+            // Deinitialize is asynchronous in its effects: it releases the implementation, whose
+            // destructor stops CEC (setEnabledInternal(false)) and only then clears the static
+            // _instance pointer.  Waiting for that pointer to clear is waiting for the plugin's
+            // own threads to have been stopped, on an observable the production code publishes,
+            // rather than on a fixed sleep - and it has to happen HERE, because the base
+            // fixture's destructor (which runs next) deletes the CEC, IARM and device-settings
+            // mocks those threads call into.
+            //
+            // Reported rather than asserted: the wait exists to protect the teardown, and the
+            // condition it guards against is already covered by the re-statement above.  A
+            // verdict here would attribute a host-level profile problem to whichever test
+            // happened to own the fixture.
+            const int kTeardownWaitMs = 5000;
+            int waitedMs = 0;
+            while ((Plugin::HdmiCecSourceImplementation::_instance != nullptr) && (waitedMs < kTeardownWaitMs)) {
+                usleep(10 * 1000);
+                waitedMs += 10;
+            }
+            if (Plugin::HdmiCecSourceImplementation::_instance != nullptr) {
+                printf("HdmiCecSourceInitializedTest: the plugin implementation was still alive %d ms "
+                       "after Deinitialize, so its worker threads may outlive the mocks this fixture "
+                       "is about to release\n",
+                    waitedMs);
+            }
+
+            // NO removeFile HERE.  The file this fixture borrowed is handed back by
+            // devicePropertiesCustody when it is destroyed a moment from now - to its captured
+            // contents, mode and owner, or to ABSENT if that is what was there.  Deleting it
+            // unconditionally is what left the host without a profile file at all.
     }
 };
 
@@ -2066,6 +2292,12 @@ TEST_F(HdmiCecSourceInitializedTest, sendKeyPressEvent20)
 TEST_F(HdmiCecSourceTest, NotSupportedPlugin)
 {
     ScopedLifecycleFiles lifecycleFiles;
+    // Custody refused means this guard touched NOTHING, so there is no provisioned state for the
+    // body below to read and nothing was tested: reported as SKIPPED rather than failed.  See
+    // ScopedLifecycleFiles::CustodyHeld for why the two verdicts are not interchangeable.
+    if (!lifecycleFiles.CustodyHeld()) {
+        GTEST_SKIP() << kLifecycleCustodyRefused;
+    }
     ASSERT_TRUE(lifecycleFiles.IsValid()) << "Could not snapshot the process-global lifecycle files.";
 
     removeFile("/etc/device.properties");
@@ -2127,10 +2359,25 @@ TEST_F(HdmiCecSourceTest, NotSupportedPlugin)
 // own file back is still that object's job.
 TEST_F(HdmiCecSourceTest, LoadSettingsCreatesDefaultsWhenTheSettingsFileIsAbsent)
 {
+    // Custody refused means the base fixture's settings-file guard touched NOTHING, so the
+    // cleared state this arm needs was never established and nothing below would be measuring
+    // what it claims to: reported as SKIPPED rather than as a failure this test did not observe.
+    if (!cecSettingsFileCustody.CustodyHeld()) {
+        GTEST_SKIP() << "custody of " << CEC_SETTING_ENABLED_FILE << " is held by another run "
+                        "on this host, so the fixture deliberately left it alone and the cleared "
+                        "state this test requires was never established.  Nothing was measured "
+                        "and nothing was changed - this is a SKIP, not a failure.";
+    }
     ASSERT_TRUE(cecSettingsFileCustody.IsPrepared())
         << "the fixture could not put " << CEC_SETTING_ENABLED_FILE << " into the absent state";
 
     ScopedLifecycleFiles lifecycleFiles;
+    // Custody refused means this guard touched NOTHING, so there is no provisioned state for the
+    // body below to read and nothing was tested: reported as SKIPPED rather than failed.  See
+    // ScopedLifecycleFiles::CustodyHeld for why the two verdicts are not interchangeable.
+    if (!lifecycleFiles.CustodyHeld()) {
+        GTEST_SKIP() << kLifecycleCustodyRefused;
+    }
     ASSERT_TRUE(lifecycleFiles.IsValid()) << "Could not snapshot the process-global lifecycle files.";
 
     removeFile(CEC_SETTING_ENABLED_FILE);
@@ -2169,10 +2416,25 @@ TEST_F(HdmiCecSourceTest, LoadSettingsCreatesDefaultsWhenTheSettingsFileIsAbsent
 // fall-through to arm 1 fails this test rather than passing it quietly.
 TEST_F(HdmiCecSourceTest, LoadSettingsHonoursAnExistingSettingsFile)
 {
+    // Custody refused means the base fixture's settings-file guard touched NOTHING, so the
+    // cleared state this arm needs was never established and nothing below would be measuring
+    // what it claims to: reported as SKIPPED rather than as a failure this test did not observe.
+    if (!cecSettingsFileCustody.CustodyHeld()) {
+        GTEST_SKIP() << "custody of " << CEC_SETTING_ENABLED_FILE << " is held by another run "
+                        "on this host, so the fixture deliberately left it alone and the cleared "
+                        "state this test requires was never established.  Nothing was measured "
+                        "and nothing was changed - this is a SKIP, not a failure.";
+    }
     ASSERT_TRUE(cecSettingsFileCustody.IsPrepared())
         << "the fixture could not put " << CEC_SETTING_ENABLED_FILE << " into the absent state";
 
     ScopedLifecycleFiles lifecycleFiles;
+    // Custody refused means this guard touched NOTHING, so there is no provisioned state for the
+    // body below to read and nothing was tested: reported as SKIPPED rather than failed.  See
+    // ScopedLifecycleFiles::CustodyHeld for why the two verdicts are not interchangeable.
+    if (!lifecycleFiles.CustodyHeld()) {
+        GTEST_SKIP() << kLifecycleCustodyRefused;
+    }
     ASSERT_TRUE(lifecycleFiles.IsValid()) << "Could not snapshot the process-global lifecycle files.";
 
     // Every label present, so the read arm's four "label missing" sub-branches are not taken
@@ -2891,6 +3153,12 @@ TEST_F(HdmiCecSourceInitializedEventTest, giveDeviceVendorIdProcess_sendfailure)
 TEST_F(HdmiCecSourceTest, Deactivated_MatchingConnectionId)
 {
     ScopedLifecycleFiles lifecycleFiles;
+    // Custody refused means this guard touched NOTHING, so there is no provisioned state for the
+    // body below to read and nothing was tested: reported as SKIPPED rather than failed.  See
+    // ScopedLifecycleFiles::CustodyHeld for why the two verdicts are not interchangeable.
+    if (!lifecycleFiles.CustodyHeld()) {
+        GTEST_SKIP() << kLifecycleCustodyRefused;
+    }
     ASSERT_TRUE(lifecycleFiles.IsValid());
 
     RPC::IRemoteConnection::INotification* notification = nullptr;
@@ -2937,6 +3205,12 @@ TEST_F(HdmiCecSourceTest, Deactivated_MatchingConnectionId)
 TEST_F(HdmiCecSourceTest, Deactivated_MismatchedConnectionId)
 {
     ScopedLifecycleFiles lifecycleFiles;
+    // Custody refused means this guard touched NOTHING, so there is no provisioned state for the
+    // body below to read and nothing was tested: reported as SKIPPED rather than failed.  See
+    // ScopedLifecycleFiles::CustodyHeld for why the two verdicts are not interchangeable.
+    if (!lifecycleFiles.CustodyHeld()) {
+        GTEST_SKIP() << kLifecycleCustodyRefused;
+    }
     ASSERT_TRUE(lifecycleFiles.IsValid());
 
     RPC::IRemoteConnection::INotification* notification = nullptr;
@@ -2964,6 +3238,12 @@ TEST_F(HdmiCecSourceTest, Deactivated_MismatchedConnectionId)
 TEST_F(HdmiCecSourceTest, Activated_RemoteConnection)
 {
     ScopedLifecycleFiles lifecycleFiles;
+    // Custody refused means this guard touched NOTHING, so there is no provisioned state for the
+    // body below to read and nothing was tested: reported as SKIPPED rather than failed.  See
+    // ScopedLifecycleFiles::CustodyHeld for why the two verdicts are not interchangeable.
+    if (!lifecycleFiles.CustodyHeld()) {
+        GTEST_SKIP() << kLifecycleCustodyRefused;
+    }
     ASSERT_TRUE(lifecycleFiles.IsValid());
 
     RPC::IRemoteConnection::INotification* notification = nullptr;
@@ -2988,6 +3268,12 @@ TEST_F(HdmiCecSourceTest, Activated_RemoteConnection)
 TEST_F(HdmiCecSourceTest, QueryInterface_HdmiCecSourceNotification)
 {
     ScopedLifecycleFiles lifecycleFiles;
+    // Custody refused means this guard touched NOTHING, so there is no provisioned state for the
+    // body below to read and nothing was tested: reported as SKIPPED rather than failed.  See
+    // ScopedLifecycleFiles::CustodyHeld for why the two verdicts are not interchangeable.
+    if (!lifecycleFiles.CustodyHeld()) {
+        GTEST_SKIP() << kLifecycleCustodyRefused;
+    }
     ASSERT_TRUE(lifecycleFiles.IsValid());
 
     RPC::IRemoteConnection::INotification* notification = nullptr;
@@ -3014,6 +3300,12 @@ TEST_F(HdmiCecSourceTest, QueryInterface_HdmiCecSourceNotification)
 TEST_F(HdmiCecSourceTest, QueryInterface_RemoteConnectionNotification)
 {
     ScopedLifecycleFiles lifecycleFiles;
+    // Custody refused means this guard touched NOTHING, so there is no provisioned state for the
+    // body below to read and nothing was tested: reported as SKIPPED rather than failed.  See
+    // ScopedLifecycleFiles::CustodyHeld for why the two verdicts are not interchangeable.
+    if (!lifecycleFiles.CustodyHeld()) {
+        GTEST_SKIP() << kLifecycleCustodyRefused;
+    }
     ASSERT_TRUE(lifecycleFiles.IsValid());
 
     RPC::IRemoteConnection::INotification* notification = nullptr;
@@ -3040,6 +3332,12 @@ TEST_F(HdmiCecSourceTest, QueryInterface_RemoteConnectionNotification)
 TEST_F(HdmiCecSourceTest, QueryInterface_Unsupported)
 {
     ScopedLifecycleFiles lifecycleFiles;
+    // Custody refused means this guard touched NOTHING, so there is no provisioned state for the
+    // body below to read and nothing was tested: reported as SKIPPED rather than failed.  See
+    // ScopedLifecycleFiles::CustodyHeld for why the two verdicts are not interchangeable.
+    if (!lifecycleFiles.CustodyHeld()) {
+        GTEST_SKIP() << kLifecycleCustodyRefused;
+    }
     ASSERT_TRUE(lifecycleFiles.IsValid());
 
     RPC::IRemoteConnection::INotification* notification = nullptr;
@@ -3062,6 +3360,12 @@ TEST_F(HdmiCecSourceTest, QueryInterface_Unsupported)
 TEST_F(HdmiCecSourceTest, Initialize_PluginUnavailable)
 {
     ScopedLifecycleFiles lifecycleFiles;
+    // Custody refused means this guard touched NOTHING, so there is no provisioned state for the
+    // body below to read and nothing was tested: reported as SKIPPED rather than failed.  See
+    // ScopedLifecycleFiles::CustodyHeld for why the two verdicts are not interchangeable.
+    if (!lifecycleFiles.CustodyHeld()) {
+        GTEST_SKIP() << kLifecycleCustodyRefused;
+    }
     ASSERT_TRUE(lifecycleFiles.IsValid());
 
     ON_CALL(service, ConfigLine())
@@ -3088,6 +3392,12 @@ TEST_F(HdmiCecSourceTest, Initialize_PluginUnavailable)
 TEST_F(HdmiCecSourceTest, Deinitialize_RemoteConnectionTerminateThrows)
 {
     ScopedLifecycleFiles lifecycleFiles;
+    // Custody refused means this guard touched NOTHING, so there is no provisioned state for the
+    // body below to read and nothing was tested: reported as SKIPPED rather than failed.  See
+    // ScopedLifecycleFiles::CustodyHeld for why the two verdicts are not interchangeable.
+    if (!lifecycleFiles.CustodyHeld()) {
+        GTEST_SKIP() << kLifecycleCustodyRefused;
+    }
     ASSERT_TRUE(lifecycleFiles.IsValid());
 
     const string initializationResult(plugin->Initialize(&service));

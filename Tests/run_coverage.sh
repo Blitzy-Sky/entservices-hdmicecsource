@@ -474,21 +474,20 @@ readonly L2_EXCLUDES=(
 #   would therefore be false, so the waiver is scoped to the level that genuinely cannot
 #   reach it.
 #
-#   plugin/HdmiCecSource.cpp at L2 -- MEASURED at 33/53 = 62.3%.  That figure, and the
-#   enumeration below, are what the current tree actually reports; an earlier revision of this
-#   comment quoted a 40/53 = 75.5% "ceiling" over thirteen lines, and both numbers were wrong.
-#   The measured total is TWENTY uncovered lines, and the two groups the old accounting missed
-#   are named explicitly here so the arithmetic reconciles: Deactivated() contributes four
-#   instrumented lines rather than one, and the non-STB profile rejection contributes four that
-#   were not accounted for at all.  Grouped by what actually blocks each line:
+#   plugin/HdmiCecSource.cpp at L2 -- MEASURED at 40/53 = 75.5%, THIRTEEN uncovered lines.
+#   Those figures come from filtered_coverage_l2.info of the run that produced this verdict, and
+#   they are the same figures the per-file table above prints -- read them off the trace, not off
+#   this comment, if the two ever disagree.  A previous revision of this comment claimed
+#   33/53 = 62.3% over twenty lines, reached by attributing four instrumented lines to
+#   Deactivated() and four to the non-STB profile rejection; both attributions were wrong.  Per
+#   the trace, Deactivated() contributes exactly ONE uncovered line, and the four non-STB
+#   rejection lines are COVERED at L2 (61, 62, 112 and 113 each record 2 hits), so that group
+#   does not exist.  The thirteen, grouped by what actually blocks each line:
 #     * the out-of-process teardown block -- 7 lines (129, 131, 133-136, 138).  At L2 the
 #       implementation is resolved IN-PROCESS by _service->Root<>(), so _connectionId stays 0,
 #       _service->RemoteConnection(0) returns null, and Terminate(), its catch arm and Release()
 #       are dead by construction.  The suite log corroborates it: "Failed to terminate
 #       connection" appears zero times across the whole run.
-#     * Deactivated(RPC::IRemoteConnection*) -- 4 lines (154, 156, 159, 161).  Thunder calls
-#       this only when an out-of-process connection dies, and the id comparison could not hold
-#       even then: Thunder allocates connection ids from 1 while _connectionId is 0 in-process.
 #     * the Root<> failure arm -- 3 lines (87, 88, 93).  A live Thunder host resolves Root<>
 #       against an installed, loadable implementation library; there is no L2 seam that makes it
 #       return null, and manufacturing one would be a production change.  Covered at L1, where
@@ -496,17 +495,18 @@ readonly L2_EXCLUDES=(
 #     * Information() -- 2 lines (149, 151).  PluginHost::IPlugin::Information() is declared
 #       pure virtual at Thunder/Source/plugins/IPlugin.h:97 and is called NOWHERE in Thunder
 #       R4.4.1; a grep of Thunder/Source finds only the Controller's own override.
-#     * the non-STB profile rejection -- 4 lines (61, 62, 112, 113).  These ARE reachable at L2
-#       and are not claimed otherwise: a test could deactivate the plugin, rewrite the
-#       host-global /etc/device.properties to a non-STB profile and reactivate -- exactly what
-#       the sink repository's PluginRefusesToActivateUnderANonSinkProfile does at L2.  They are
-#       left uncovered as a deliberate, stated decision: covering them gives 37/53 = 69.8%,
-#       still short of the bar, so it would not change this verdict, and the same four lines are
-#       already covered by this repository's L1 suite.
+#     * Deactivated(RPC::IRemoteConnection*) -- 1 line (159), the body guarded by the connection
+#       -id comparison.  Thunder calls this method only when an out-of-process connection dies,
+#       and the comparison could not hold even then: Thunder allocates connection ids from 1
+#       while _connectionId is 0 in-process.  The method's other instrumented lines (154, 156
+#       and 161) ARE covered, which is why this group is one line and not four.
+#   7 + 3 + 2 + 1 = 13, and 53 - 13 = 40, which reconciles with the printed 75.5%.
 #   This repository's own L1 suite measures the SAME file at 53/53 = 100%, so the TARGET meets
 #   the section-0.9.2 bar; what sits below the bar is this one LEVEL's view of it.  The verdict
 #   is therefore waived HERE, at the point of measurement, with the file kept in the denominator
-#   and its real 62.3% printed.  It is not filtered out and COVERAGE_MIN is not lowered.
+#   and its real 75.5% printed.  It is not filtered out and COVERAGE_MIN is not lowered, and the
+#   cross-level best-single-level verdict printed at the end of the run states the same conclusion from the
+#   measurements themselves rather than from this prose.
 # ------------------------------------------------------------------------------------
 readonly L1_GATE_EXEMPT=(
     'plugin/Module.cpp'
@@ -524,16 +524,19 @@ readonly L2_GATE_EXEMPT=(
 # Format: <path relative to the repository>=<recorded baseline line coverage percentage>
 #
 # LEVEL-SCOPED, and for a measured reason.  The recorded baselines were taken from the L1
-# suite, and L1 and L2 exercise genuinely different code: the same file measures 82.1% under
-# L1 and 81.6% under L2, and HdmiCecSourceImplementation.cpp measures 86.1% under L1 and
-# 71.2% under L2, simply because an in-process unit suite and a Thunder-hosted functional
-# suite reach different paths.  Applying an L1 baseline to an L2 trace would therefore report
-# a "regression" that never happened, so a floor must be recorded per level from a trace
-# measured at that level, never carried across.
+# suite, and L1 and L2 exercise genuinely different code: HdmiCecSourceImplementation.h measures
+# 82.1% under L1 and 89.5% under L2, and HdmiCecSourceImplementation.cpp measures 86.1% under L1
+# and 85.4% under L2, simply because an in-process unit suite and a Thunder-hosted functional
+# suite reach different paths -- note the direction differs per file, which is precisely why a
+# level's floor cannot be inferred from the other level.  Applying an L1 baseline to an L2 trace
+# would therefore report a "regression" that never happened, so a floor must be recorded per
+# level from a trace measured at that level, never carried across.
 #
-# The L2 floors below were MEASURED, not chosen.  Each figure is the measured value, recorded
-# exactly, with no margin added or subtracted.  They exist because the L2 level had no floor at all
-# until this script existed, so nothing protected the level's gain from 72.4%.
+# The L2 floors below were MEASURED, not chosen: each is the value a real L2 capture reported at
+# the point the floor was recorded, with no margin added or subtracted.  They are HISTORICAL
+# baselines and are deliberately not re-based on every later capture -- re-basing a floor to the
+# newest figure is what would make it decorative.  They exist because the L2 level had no floor
+# of any kind until this script existed.
 #
 # WHAT THE FROZEN SPECIFICATION DOES AND DOES NOT FIX, because the floors below depend on it.
 # The specification's frozen artefact is the SET OF PATHS it transforms, NOT a per-file case
@@ -572,8 +575,13 @@ readonly L2_GATE_EXEMPT=(
 # THE LEVEL MEETS THE 80% BAR, and it does so the only permitted way -- by adding tests.  No
 # exclusion glob was added, COVERAGE_MIN was not lowered, no extra file was waived, and no
 # production source was touched.
+#
+# Both sets of numbers are stated deliberately: a floor is only meaningful next to the figure it
+# is being compared against, and stated side by side they show that every floor below holds with
+# MARGIN rather than exactly.  Read the current figure off the per-file table this run prints --
+# not off this comment.
 #   plugin/HdmiCecSource.cpp is deliberately NOT given an L2 floor: it is enumerated in
-#   L2_GATE_EXEMPT at its measured 62.3%, and a floor on a waived verdict would be a
+#   L2_GATE_EXEMPT at its measured 75.5%, and a floor on a waived verdict would be a
 #   second, contradictory judgement on the same file.
 # ------------------------------------------------------------------------------------
 readonly L1_COVERAGE_FLOORS=(
@@ -2757,7 +2765,135 @@ per_file_report() {
     report_acceptance_target "$level" "$report"
     report_floors "$level" "$report"
     report_exemptions "$level" "$report"
+    report_cross_level_union "$level" "$report"
     report_attribution_guidance "$level"
+}
+
+# ------------------------------------------------------------------------------------
+# CROSS-LEVEL UNION VERDICT.
+#
+# The specification's bar (section 0.9.2) is stated PER TARGET, and a target is a production
+# file -- not a (file, level) pair.  This runner necessarily gates per level, because a level is
+# all one run can measure, so a file that clears the bar at the other level still needs a
+# level-scoped waiver here.  Read level by level those waivers look like extra carve-outs beyond
+# the plugin Module.cpp pair the specification names; read as a UNION they are redundant, because
+# the target itself is above the bar.
+#
+# This block states that from the measurements instead of from prose.  For every file below the
+# bar at this level it prints the other level's figure and the resulting per-TARGET verdict, and
+# it prefers a LIVE figure -- the sibling level's filtered trace under the same artifact root --
+# falling back to a recorded reference only when that trace is absent, and labelling which of the
+# two it used every time.  Nothing here can change the gate: the gate has already been decided
+# per level by apply_gate(), and this is reporting, not judgement.
+# ------------------------------------------------------------------------------------
+# Recorded cross-level line coverage, used ONLY when the sibling level's trace is not present in
+# this artifact root.  Every figure is a measured value from a real capture of that level, and it
+# is printed labelled "recorded" so it is never mistaken for something this run measured.
+readonly CROSS_LEVEL_REFERENCE=(
+    'l1/plugin/HdmiCecSource.cpp=100.0'
+    'l1/plugin/HdmiCecSource.h=98.4'
+    'l1/plugin/HdmiCecSourceImplementation.cpp=86.1'
+    'l1/plugin/HdmiCecSourceImplementation.h=82.1'
+    'l1/plugin/Module.cpp=0.0'
+    'l2/plugin/HdmiCecSource.cpp=75.5'
+    'l2/plugin/HdmiCecSource.h=95.2'
+    'l2/plugin/HdmiCecSourceImplementation.cpp=85.4'
+    'l2/plugin/HdmiCecSourceImplementation.h=89.5'
+    'l2/plugin/Module.cpp=100.0'
+)
+
+# Line coverage of one repo-relative path in one filtered trace, as a percentage with one
+# decimal, or empty when the path is not in the trace.  Reads the trace's own LF/LH records so
+# the figure is the trace's, not a re-derivation.
+trace_line_pct() { # $1 = trace path, $2 = repo-relative file path
+    local trace="$1" want="$2"
+    [ -f "$trace" ] || return 0
+    awk -v want="$want" '
+        /^SF:/ { cur = substr($0, 4); keep = (index(cur, want) && substr(cur, length(cur) - length(want) + 1) == want); next }
+        keep && /^LF:/ { lf = substr($0, 4) + 0 }
+        keep && /^LH:/ { lh = substr($0, 4) + 0 }
+        END { if (lf > 0) printf "%.1f", (100.0 * lh) / lf }
+    ' "$trace" 2>/dev/null
+}
+
+cross_level_reference_pct() { # $1 = level, $2 = repo-relative path
+    local key="$1/$2" entry
+    for entry in "${CROSS_LEVEL_REFERENCE[@]}"; do
+        case "$entry" in
+            "$key="*) printf '%s' "${entry#*=}"; return 0 ;;
+        esac
+    done
+}
+
+report_cross_level_union() { # $1 = this level, $2 = the per-file report
+    local level="$1" report="$2"
+    local paths other other_trace
+    # Every file below the bar at this level, waived or not: those are the only ones for which
+    # the union changes anything.
+    paths="$(printf '%s\n' "$report" | sed -n -e 's/^##BELOW //p' -e 's/^##EXEMPTBELOW //p' | awk 'NF {print $1}' | sort -u)"
+    [ -n "$paths" ] || return 0
+
+    case "$level" in
+        l1) other='l2' ;;
+        l2) other='l1' ;;
+        *)  return 0 ;;
+    esac
+    other_trace="$ARTIFACT_ROOT/$REPO_NAME/$other/filtered_coverage_$other.info"
+
+    rule
+    log "cross-level verdict: BEST SINGLE LEVEL per target (the specification's bar is per TARGET; this"
+    log "    runner gates per level).  This compares the two levels' line percentages and reports the"
+    log "    higher one; it is NOT a union of their covered line sets, which would be >= this figure."
+    if [ -f "$other_trace" ]; then
+        log "    ${other^^} figures below are MEASURED, read from $other_trace"
+    else
+        log "    ${other^^} figures below are RECORDED baselines, not measured by this run: no ${other^^}"
+        log "    trace exists at $other_trace.  Run '${other}' into the same --output-dir to have them"
+        log "    measured instead."
+    fi
+
+    local unresolved=0 path this_pct that_pct best best_level source
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        this_pct="$(printf '%s\n' "$report" | sed -n -e 's/^##BELOW //p' -e 's/^##EXEMPTBELOW //p' | awk -v p="$path" '$1 == p {print $2; exit}')"
+        that_pct="$(trace_line_pct "$other_trace" "$path")"
+        if [ -n "$that_pct" ]; then
+            source='measured'
+        else
+            that_pct="$(cross_level_reference_pct "$other" "$path")"
+            source='recorded'
+        fi
+        if [ -z "$that_pct" ]; then
+            warn "    $path: ${level^^} ${this_pct}%, ${other^^} unknown -- no trace and no recorded"
+            warn "        baseline, so this target's union verdict cannot be stated."
+            unresolved=$((unresolved + 1))
+            continue
+        fi
+        # Integer comparison on tenths keeps this to shell arithmetic; the printed values keep
+        # their decimal.
+        if [ "${that_pct%.*}${that_pct#*.}" -gt "${this_pct%.*}${this_pct#*.}" ] 2>/dev/null; then
+            best="$that_pct"; best_level="${other^^}"
+        else
+            best="$this_pct"; best_level="${level^^}"
+        fi
+        if [ "${best%.*}" -ge "$COVERAGE_MIN" ] 2>/dev/null; then
+            log "    $path: ${level^^} ${this_pct}%, ${other^^} ${that_pct}% ($source) -> best ${best}% at ${best_level}: TARGET MEETS the ${COVERAGE_MIN}% bar"
+        else
+            warn "    $path: ${level^^} ${this_pct}%, ${other^^} ${that_pct}% ($source) -> best ${best}% at ${best_level}: TARGET IS BELOW the ${COVERAGE_MIN}% bar AT EVERY LEVEL"
+            unresolved=$((unresolved + 1))
+        fi
+    done <<EOF
+$paths
+EOF
+
+    if [ "$unresolved" -eq 0 ]; then
+        log "    Every target below the bar at ${level^^} clears it at ${other^^}, so each ${level^^} waiver"
+        log "    above is redundant under the per-target reading and none of them hides a real gap."
+    else
+        warn "    $unresolved target(s) above are NOT accounted for by the other level.  A waiver for"
+        warn "    one of those would be a genuine carve-out and must be justified as such, not as a"
+        warn "    level artefact."
+    fi
 }
 
 # ------------------------------------------------------------------------------------
@@ -2821,10 +2957,11 @@ report_floors() {
     log "must-not-regress floors (recorded ${level^^} baseline percentages, not live measurements):"
     if [ "$level" = l2 ]; then
         log "    Recorded per level and never carried across: the two levels reach different code, so"
-        log "    HdmiCecSourceImplementation.cpp measures 86.1% under L1 and 84.8% under L2 from the"
-        log "    same sources.  These L2 figures were measured by this script once the L2 cases that"
-        log "    closed the gap were in place; before them the level had no floor at all and nothing"
-        log "    protected the move from 72.4% to 85.1%."
+        log "    HdmiCecSourceImplementation.cpp measures 86.1% under L1 and 85.4% under L2 from the"
+        log "    same sources.  These L2 floors were measured by this script from a real L2 capture"
+        log "    taken once the L2 cases that closed the gap were in place; before them the level had"
+        log "    no floor of any kind.  They are HISTORICAL baselines, not re-based on later captures,"
+        log "    so the 'now' figures below are expected to sit at or above them rather than on them."
     fi
     if [ -n "$ok" ]; then
         printf '%s\n' "$ok" | while read -r path now floor; do
@@ -2879,22 +3016,17 @@ gate_exempt_reason() {
             log "        that loads the plugin.  Saying 'uncoverable' unqualified would be false."
             ;;
         l2/plugin/HdmiCecSource.cpp)
-            log "        Reason: MEASURED at 33/53 = 62.3% under L2, with all 20 uncovered lines"
-            log "        enumerated below and grouped by what actually blocks each one.  Sixteen are"
-            log "        unreachable from the L2 execution model; four are reachable but would not"
-            log "        lift the file over the bar, and are stated as such rather than dressed up as"
-            log "        impossible:"
+            log "        Reason: MEASURED at 40/53 = 75.5% under L2 -- the same figure the per-file"
+            log "        table above prints for this file, read off this run's trace.  All THIRTEEN"
+            log "        uncovered lines are enumerated below and grouped by what actually blocks"
+            log "        each one; every one of the thirteen is unreachable from the L2 execution"
+            log "        model, and each group's line list is what the trace records as uncovered:"
             log "          - the out-of-process teardown block (7 lines: 129, 131, 133-136, 138)."
             log "            Initialize() obtains the implementation with _service->Root<>(), and at"
             log "            L2 that resolves IN-PROCESS, so _connectionId stays 0 and"
             log "            _service->RemoteConnection(0) returns null -- Terminate(), its catch arm"
             log "            and Release() are dead by construction.  Corroborated by the run itself:"
             log "            'Failed to terminate connection' appears zero times in the suite log."
-            log "          - Deactivated(RPC::IRemoteConnection*) (4 lines: 154, 156, 159, 161)."
-            log "            Thunder invokes this only when an out-of-process connection dies, and"
-            log "            the id-match cannot hold anyway: connection ids start at 1 while"
-            log "            _connectionId is 0 in-process.  All four instrumented lines of the"
-            log "            function are therefore unreached, not just the Submit call."
             log "          - the Root<> failure arm (3 lines: 87, 88, 93).  A live Thunder host"
             log "            resolves Root<> against an installed, loadable implementation library;"
             log "            there is no L2 seam that makes it return null, and manufacturing one"
@@ -2903,18 +3035,20 @@ gate_exempt_reason() {
             log "            virtual at Thunder/Source/plugins/IPlugin.h:97 and is called nowhere in"
             log "            Thunder R4.4.1 -- only the Controller's own override exists, so no L2"
             log "            client can invoke it."
-            log "          - the non-STB profile rejection (4 lines: 61, 62, 112, 113).  These are"
-            log "            REACHABLE at L2 and are not claimed otherwise: a test could deactivate"
-            log "            the plugin, rewrite the host-global /etc/device.properties to a non-STB"
-            log "            profile and reactivate, which is precisely what the sink repository's"
-            log "            PluginRefusesToActivateUnderANonSinkProfile does.  They are left"
-            log "            uncovered deliberately, because covering them yields 37/53 = 69.8% --"
-            log "            still short of 80% -- so it would not change this verdict, while the"
-            log "            same four lines are already covered at L1."
+            log "          - Deactivated(RPC::IRemoteConnection*) (1 line: 159), the body guarded by"
+            log "            the connection-id comparison.  Thunder invokes this method only when an"
+            log "            out-of-process connection dies, and the id-match cannot hold anyway:"
+            log "            connection ids start at 1 while _connectionId is 0 in-process.  Its"
+            log "            other instrumented lines (154, 156 and 161) ARE covered, so this group"
+            log "            is one line -- an earlier revision of this text claimed four here, and"
+            log "            also invented a fifth group of four 'non-STB profile rejection' lines"
+            log "            (61, 62, 112, 113) which the trace records as COVERED, 2 hits each."
+            log "        7 + 3 + 2 + 1 = 13 uncovered, so 53 - 13 = 40 covered = 75.5%, reconciling"
+            log "        with the figure printed above."
             log "        This repository's own L1 suite measures the SAME file at 53/53 = 100%, so the"
             log "        TARGET meets the specification-section-0.9.2 bar; what is below the bar is"
             log "        this one LEVEL's view of it.  No exclusion glob was added and COVERAGE_MIN"
-            log "        was not lowered -- the file stays in the denominator and its real 62.3% is"
+            log "        was not lowered -- the file stays in the denominator and its real 75.5% is"
             log "        printed above."
             ;;
         *)
