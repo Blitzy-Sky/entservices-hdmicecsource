@@ -504,39 +504,83 @@ readonly L2_EXCLUDES=(
 #   would therefore be false, so the waiver is scoped to the level that genuinely cannot
 #   reach it.
 #
-#   plugin/HdmiCecSource.cpp at L2 -- MEASURED at 40/53 = 75.5%, THIRTEEN uncovered lines.
+#   plugin/HdmiCecSource.cpp at L2 -- MEASURED at 42/53 = 79.2%, ELEVEN uncovered lines.
 #   Those figures come from filtered_coverage_l2.info of the run that produced this verdict, and
 #   they are the same figures the per-file table above prints -- read them off the trace, not off
-#   this comment, if the two ever disagree.  A previous revision of this comment claimed
-#   33/53 = 62.3% over twenty lines, reached by attributing four instrumented lines to
-#   Deactivated() and four to the non-STB profile rejection; both attributions were wrong.  Per
-#   the trace, Deactivated() contributes exactly ONE uncovered line, and the four non-STB
-#   rejection lines are COVERED at L2 (61, 62, 112 and 113 each record 2 hits), so that group
-#   does not exist.  The thirteen, grouped by what actually blocks each line:
+#   this comment, if the two ever disagree.
+#
+#   TWO EARLIER REVISIONS OF THIS COMMENT WERE WRONG, and both corrections are kept here because
+#   the wrong figures were quoted downstream.  The first claimed 33/53 = 62.3% over twenty lines,
+#   by attributing four instrumented lines to Deactivated() and four to the non-STB profile
+#   rejection; per the trace Deactivated() contributes exactly ONE uncovered line, and the four
+#   non-STB rejection lines are COVERED at L2 (61, 62, 112 and 113 each record hits), so that
+#   group never existed.  The second claimed 40/53 = 75.5% over thirteen lines and asserted that
+#   Information() was unreachable at L2; it is reachable, and a case now covers it -- see below.
+#
+#   WHAT CHANGED, AND HOW.  Information() (lines 149 and 151) is no longer uncovered.
+#   PluginHost::IPlugin::Information() is indeed called NOWHERE in Thunder R4.4.1 -- it is pure
+#   virtual at Thunder/Source/plugins/IPlugin.h:97 and a grep of Thunder/Source finds only the
+#   Controller's own override at Controller.cpp:176 -- so no host path reaches it.  But the plugin
+#   publishes INTERFACE_ENTRY(PluginHost::IPlugin) at HdmiCecSource.h:160-164,
+#   Server::Service::QueryInterface forwards any id that is not IUnknown or IShell straight to the
+#   plugin handler (Thunder/Source/WPEFramework/PluginServer.cpp:277-301), and Thunder's generated
+#   ProxyStubs_Plugin.cpp marshals Information() across COM-RPC.  The L2 fixture already holds a
+#   PluginHost::IShell for this callsign, so one QueryInterface reaches the facet.
+#   HdmiCecSource_L2Test.PluginShellExposesIPluginAndReportsItsInformationString does exactly that
+#   and moved this view from 40/53 = 75.5% to 42/53 = 79.2%.  It is additive: no existing case was
+#   modified to obtain those two lines.
+#
+#   THE ELEVEN THAT REMAIN, grouped by what actually blocks each one:
 #     * the out-of-process teardown block -- 7 lines (129, 131, 133-136, 138).  At L2 the
 #       implementation is resolved IN-PROCESS by _service->Root<>(), so _connectionId stays 0,
 #       _service->RemoteConnection(0) returns null, and Terminate(), its catch arm and Release()
-#       are dead by construction.  The suite log corroborates it: "Failed to terminate
-#       connection" appears zero times across the whole run.
-#     * the Root<> failure arm -- 3 lines (87, 88, 93).  A live Thunder host resolves Root<>
-#       against an installed, loadable implementation library; there is no L2 seam that makes it
-#       return null, and manufacturing one would be a production change.  Covered at L1, where
-#       the COMLink is a mock.
-#     * Information() -- 2 lines (149, 151).  PluginHost::IPlugin::Information() is declared
-#       pure virtual at Thunder/Source/plugins/IPlugin.h:97 and is called NOWHERE in Thunder
-#       R4.4.1; a grep of Thunder/Source finds only the Controller's own override.
-#     * Deactivated(RPC::IRemoteConnection*) -- 1 line (159), the body guarded by the connection
-#       -id comparison.  Thunder calls this method only when an out-of-process connection dies,
-#       and the comparison could not hold even then: Thunder allocates connection ids from 1
-#       while _connectionId is 0 in-process.  The method's other instrumented lines (154, 156
-#       and 161) ARE covered, which is why this group is one line and not four.
-#   7 + 3 + 2 + 1 = 13, and 53 - 13 = 40, which reconciles with the printed 75.5%.
-#   This repository's own L1 suite measures the SAME file at 53/53 = 100%, so the TARGET meets
-#   the section-0.9.2 bar; what sits below the bar is this one LEVEL's view of it.  The verdict
-#   is therefore waived HERE, at the point of measurement, with the file kept in the denominator
-#   and its real 75.5% printed.  It is not filtered out and COVERAGE_MIN is not lowered, and the
-#   cross-level best-single-level verdict printed at the end of the run states the same conclusion from the
-#   measurements themselves rather than from this prose.
+#       are dead by construction.  The suite log corroborates it: the LOGWARN this plugin emits
+#       from that catch arm (HdmiCecSource.cpp:135) appears nowhere in the run's output.  The
+#       message text is deliberately not quoted here -- quoting it would make a grep for it match
+#       this comment and this script's own log line, which is exactly how a self-referential
+#       "appears zero times" claim becomes unfalsifiable.  Reaching them needs the plugin
+#       instantiated OUT OF PROCESS, i.e. a root/mode configuration that spawns WPEProcess -- and
+#       a spawned child would hold its own copies of the force-included HAL/device-settings mock
+#       singletons, unprogrammed, so the implementation it hosts would not be the one this suite
+#       configures.  That is a different harness, not a different test, and Sec. 0.2.1 forbids
+#       introducing a harness construct no documented gap requires.
+#     * the Root<> failure arm -- 3 lines (87, 88, 93).  This arm IS drivable from a test, which
+#       the previous revision of this comment denied: IShell::Root() returns null in-process when
+#       root.locator names a library that cannot be loaded (Thunder/Source/plugins/Shell.cpp:61-93),
+#       and Controller.1.configuration@<callsign> accepts a new configuration while the plugin is
+#       DEACTIVATED (Controller.cpp:294-325, Service.h:209-229).  Driving it CRASHES THE HOST, and
+#       the crash is a PRODUCTION DEFECT in this plugin, not a limitation of the harness:
+#       HdmiCecSource::Initialize calls Deinitialize(service) itself on the failure arm
+#       (HdmiCecSource.cpp:93), which clears _service to nullptr at :145; Thunder then sees the
+#       non-empty error string, and because LegacyInitialize defaults false and the installed
+#       config.json does not set it, Server::Service::Activate calls Deactivate(reason::
+#       INITIALIZATION_FAILED) (PluginServer.cpp:402-410), which calls _handler->Deinitialize(this)
+#       a SECOND time; that second entry reaches _service->Unregister(&_notification) at :143 with
+#       _service already null and dereferences it.  So the three lines cannot be covered at L2
+#       without taking the plugin host down mid-suite.  REQUIRED PRODUCTION CHANGE, reported and
+#       deliberately NOT made (Directive 6, Sec. 0.2.1): make Deinitialize idempotent -- return
+#       early when _service is already nullptr, or stop Initialize from calling Deinitialize and
+#       let Thunder's own INITIALIZATION_FAILED path perform the single teardown.  Either one is a
+#       one-line guard in plugin/HdmiCecSource.cpp and is outside this engagement's scope.  The
+#       three lines ARE covered at L1, where the COMLink is a mock and no host is involved.
+#     * Deactivated(RPC::IRemoteConnection*) -- 1 line (159), the body guarded by the connection-id
+#       comparison.  The method itself IS reached at L2 -- its other instrumented lines (154, 156
+#       and 161) are covered, because Thunder reports every COM-RPC channel this suite opens and
+#       closes to the registered sink -- but the comparison cannot hold: Thunder allocates
+#       connection ids from 1 while _connectionId is 0 for an in-process instantiation.  Same root
+#       cause as the teardown block above, and the same out-of-process prerequisite.
+#   7 + 3 + 1 = 11, and 53 - 11 = 42, which reconciles with the printed 79.2%.
+#
+#   THE TARGET MEETS THE BAR; THIS ONE LEVEL'S VIEW OF IT DOES NOT.  This repository's own L1
+#   suite measures the SAME file at 53/53 = 100%, so the Sec. 0.9.2 target is met at the level the
+#   specification measured its baseline at.  The verdict is therefore waived HERE, at the point of
+#   measurement, with the file kept in the denominator and its real 79.2% printed.  It is not
+#   filtered out, COVERAGE_MIN is not lowered, and the cross-level best-single-level verdict
+#   printed at the end of the run states the same conclusion from the measurements themselves
+#   rather than from this prose.  The residual 0.8 percentage points to the bar are the three
+#   Root<> lines, and they are reachable the moment the production guard above exists -- 45/53 =
+#   84.9% -- which is why this waiver is written as a pointer to a specific production fix rather
+#   than as a permanent exemption.
 # ------------------------------------------------------------------------------------
 readonly L1_GATE_EXEMPT=(
     'plugin/Module.cpp'
@@ -596,6 +640,12 @@ readonly L2_GATE_EXEMPT=(
 # and plugin/Module.cpp at 100.0% (1/1).  Re-run `l2` for today's numbers rather than reading
 # either set as current -- re-measuring them is precisely this script's job.
 #
+# UPDATED after the QA-remediation pass that added
+# PluginShellExposesIPluginAndReportsItsInformationString: the level now holds 74 TEST_F cases and
+# measures 74 of 74 green, aggregate 85.8% (849/989), with plugin/HdmiCecSource.cpp at 79.2%
+# (42/53) -- up from 75.5% (40/53) -- and every other file unchanged.  The floors below are
+# deliberately left where they were, for the reason given in the next paragraph.
+#
 # The floors are deliberately LEFT at the earlier, lower values.  A floor exists to catch a
 # REGRESSION, and a stale-low floor can only ever be too permissive, never too strict: it cannot
 # manufacture a pass, because the >=80% bar is enforced separately by `lcov --fail-under-lines`
@@ -611,7 +661,7 @@ readonly L2_GATE_EXEMPT=(
 # MARGIN rather than exactly.  Read the current figure off the per-file table this run prints --
 # not off this comment.
 #   plugin/HdmiCecSource.cpp is deliberately NOT given an L2 floor: it is enumerated in
-#   L2_GATE_EXEMPT at its measured 75.5%, and a floor on a waived verdict would be a
+#   L2_GATE_EXEMPT at its measured 79.2%, and a floor on a waived verdict would be a
 #   second, contradictory judgement on the same file.
 # ------------------------------------------------------------------------------------
 readonly L1_COVERAGE_FLOORS=(
@@ -1085,15 +1135,194 @@ genhtml_run() {
     HOME="$LCOV_HOME" "$GENHTML_BIN" "$@"
 }
 
+# ------------------------------------------------------------------------------------
+# CANCELLATION.  A run that cannot be stopped is a run CI cannot cancel, and this one starts a
+# Thunder host: an uncancellable run leaves a listener on the JSON-RPC port and a bound COM-RPC
+# socket behind, and the next run then measures somebody else's host -- or refuses to start.
+#
+# Bash runs a trap only BETWEEN commands.  The suite used to be launched as a FOREGROUND child
+# -- `( cd …; timeout … "$binary_path" )` -- so while this shell sat inside that command an
+# external SIGTERM was recorded and then withheld from the handler until the child finished on
+# its own.  For the length of a whole L2 suite the runner therefore ignored its own
+# cancellation, and nothing forwarded the signal to the suite binary, to the `sh -c` that
+# entservices-testframework's L2 controller uses to start WPEFramework
+# (Tests/L2Tests/L2testController.cpp:91), or to that host.
+#
+# So the suite is launched in the BACKGROUND and in its OWN PROCESS GROUP -- `set -m` makes a
+# background job a process-group leader -- and this shell waits on it.  `wait` is interruptible,
+# so a signal reaches the handler at once; the handler then signals the whole GROUP, which is
+# `timeout`, the suite binary, the controller's `sh -c` and WPEFramework, all of which stay in
+# that group because `timeout --foreground` deliberately does not create one of its own.  A
+# bounded grace period follows, then the group is killed outright, any host that changed its own
+# group or session is terminated by exact pid, and only then is the COM-RPC socket handed back.
+SUITE_PGID=''                  # process group of the running suite; empty when none is running
+SUITE_PGID_GRACE=''            # grace period for THAT group: a nested level needs more than a suite
+SUITE_SIGNAL=''                # name of the signal that cancelled this run, if any
+SUITE_HOST_EXE=''              # resolved WPEFramework this level's suite starts (L2 only)
+SUITE_HOST_PIDS_BEFORE=' '     # hosts already running before the suite started: not ours to kill
+SUITE_SOCKET_PREEXISTING=''    # the COM-RPC socket was already there: not ours to remove
+# How long a signalled process group is given to exit before it is killed outright.  Bounded
+# because the point of the exercise is that a cancellation completes.
+SUITE_STOP_GRACE_SECONDS="${SUITE_STOP_GRACE_SECONDS:-10}"
+readonly SUITE_STOP_GRACE_SECONDS
+# The path the in-process host binds and the framework's own client connects to
+# (entservices-testframework/Tests/L2Tests/L2testController.cpp:149, hard-coded there).  It is
+# host-global, which is why this script only ever removes one it did not find already present.
+readonly COMRPC_SOCKET='/tmp/communicator'
+
+# Every pid whose /proc/<pid>/exe resolves EXACTLY to $1.
+#
+# Matching the resolved executable rather than a command-line pattern is deliberate and is not a
+# style preference: this function's output is used to send signals, and `pkill -f WPEFramework`
+# would match any process that merely mentions the name -- an editor, a log tail, another
+# runner's shell, or the harness that started this script.  An exact /proc/<pid>/exe comparison
+# cannot.
+host_pids_for_exe() { # $1 = absolute, resolved executable path
+    local exe="$1" entry link
+    [ -n "$exe" ] || return 0
+    for entry in /proc/[0-9]*; do
+        link="$(readlink -- "$entry/exe" 2>/dev/null)" || continue
+        [ "$link" = "$exe" ] || continue
+        printf '%s\n' "${entry#/proc/}"
+    done
+    return 0
+}
+
+# Wait up to $2 seconds for kill-target $1 (a pid, or -pgid) to disappear.  0 when it is gone.
+await_process_exit() { # $1 = kill target  $2 = seconds
+    local target="$1" seconds="$2" waited=0
+    while kill -0 -- "$target" 2>/dev/null; do
+        [ "$waited" -lt "$seconds" ] || return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 0
+}
+
+# Forward $1 to the suite's process group, then make sure it is actually gone.  Idempotent, so
+# the signal handler and the EXIT handler can both call it.
+stop_suite_group() { # $1 = signal name to forward
+    local signal="${1:-TERM}" grace="${SUITE_PGID_GRACE:-$SUITE_STOP_GRACE_SECONDS}"
+    [ -n "$SUITE_PGID" ] || return 0
+    if ! kill -0 -- "-$SUITE_PGID" 2>/dev/null; then
+        SUITE_PGID=''
+        return 0
+    fi
+    warn "forwarding SIG$signal to the suite process group $SUITE_PGID"
+    kill -"$signal" -- "-$SUITE_PGID" 2>/dev/null || true
+    if ! await_process_exit "-$SUITE_PGID" "$grace"; then
+        warn "the suite process group $SUITE_PGID ignored SIG$signal for"
+        warn "    ${grace}s (SUITE_STOP_GRACE_SECONDS); killing it outright."
+        kill -KILL -- "-$SUITE_PGID" 2>/dev/null || true
+        await_process_exit "-$SUITE_PGID" 5 \
+            || warn "process group $SUITE_PGID survived SIGKILL; report this, it should not happen."
+    fi
+    SUITE_PGID=''
+    return 0
+}
+
+# Terminate any Thunder host THIS run started and then hand the COM-RPC socket back.
+#
+# The group kill above already reaches a host that stayed in the group, which is the normal case
+# for a `-f` (foreground) host.  This is the second stage, for the case observed under an
+# external cancellation: a host that has changed its own process group or session, or has been
+# reparented once its ancestors died, and therefore no longer receives a group signal at all.
+# Only pids that appeared AFTER the suite was launched are touched -- a host that was already
+# running belongs to somebody else -- and the socket is only removed when this run is the party
+# that created it and no host of ours is left holding it.
+reap_suite_host() {
+    [ -n "$SUITE_HOST_EXE" ] || return 0
+    local pid ours=''
+    for pid in $(host_pids_for_exe "$SUITE_HOST_EXE"); do
+        case "$SUITE_HOST_PIDS_BEFORE" in *" $pid "*) continue ;; esac
+        ours="$ours $pid"
+    done
+    if [ -n "$ours" ]; then
+        warn "terminating the Thunder host(s) this run started:$ours"
+        for pid in $ours; do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+        for pid in $ours; do
+            await_process_exit "$pid" "$SUITE_STOP_GRACE_SECONDS" || {
+                warn "host pid $pid ignored SIGTERM; killing it"
+                kill -KILL "$pid" 2>/dev/null || true
+                await_process_exit "$pid" 5 || warn "host pid $pid survived SIGKILL"
+            }
+        done
+    fi
+    # Re-derived rather than assumed: the socket is only ours to remove once nothing of ours is
+    # still listening on it.
+    local still
+    still="$(host_pids_for_exe "$SUITE_HOST_EXE" | tr '\n' ' ')"
+    for pid in $still; do
+        case "$SUITE_HOST_PIDS_BEFORE" in *" $pid "*) continue ;; esac
+        warn "leaving $COMRPC_SOCKET in place: host pid $pid is still running"
+        return 0
+    done
+    if [ -n "$SUITE_SOCKET_PREEXISTING" ]; then
+        return 0
+    fi
+    if [ -S "$COMRPC_SOCKET" ]; then
+        rm -f -- "$COMRPC_SOCKET" \
+            && log "removed the COM-RPC socket this run created: $COMRPC_SOCKET"
+    elif [ -e "$COMRPC_SOCKET" ]; then
+        warn "$COMRPC_SOCKET exists but is not a socket, so it is left exactly as found."
+    fi
+    SUITE_HOST_EXE=''
+    return 0
+}
+
+# Record, before the suite is launched, what already existed -- so the cleanup above can tell
+# what this run is responsible for.  L2 only: the L1 suite starts no host and binds no socket.
+note_pre_run_host_state() { # $1 = level
+    SUITE_HOST_EXE=''
+    SUITE_HOST_PIDS_BEFORE=' '
+    SUITE_SOCKET_PREEXISTING=''
+    [ "$1" = 'l2' ] || return 0
+    local exe="$LEVEL_INSTALL_DIR/usr/bin/WPEFramework"
+    # The install tree ships WPEFramework as a symlink to a versioned binary and /proc/<pid>/exe
+    # reports the RESOLVED target, so the comparison has to be made against the resolved path or
+    # it never matches anything.
+    SUITE_HOST_EXE="$(readlink -f -- "$exe" 2>/dev/null || printf '%s' "$exe")"
+    SUITE_HOST_PIDS_BEFORE=" $(host_pids_for_exe "$SUITE_HOST_EXE" | tr '\n' ' ')"
+    [ -e "$COMRPC_SOCKET" ] && SUITE_SOCKET_PREEXISTING=1
+    return 0
+}
+
+# ONE cleanup handler, servicing every side effect this script has, installed once.
+#
+# Two separate EXIT traps cannot coexist: bash keeps a single handler per signal, so a second
+# `trap … EXIT` REPLACES the first, and whichever cleanup it displaced then has nobody to run
+# it -- leaving, for instance, an empty ${TMPDIR:-/tmp}/run_coverage_stage.* behind on every
+# run.  So do not add another EXIT trap: every action lives in this one handler, and all of them
+# are idempotent, so running it on a normal exit and again on a signal is harmless.  Children
+# are stopped FIRST: removing the private lcov HOME while the suite is still running would pull
+# it out from under an lcov invocation that has not finished.
 on_exit() {
     local rc=$?
+    # The signal that cancelled the run, when there was one, is the signal forwarded to whatever
+    # is still running: a run cancelled with SIGHUP should not report that it sent SIGTERM.
+    stop_suite_group "${SUITE_SIGNAL:-TERM}"
+    reap_suite_host
     cleanup_lcov_home
     return "$rc"
 }
+
+# The signal handler `exit`s rather than re-raising, because a shell terminated by a signal with
+# its default disposition never runs its EXIT trap: re-raising would have skipped the staging
+# cleanup, the private lcov HOME and -- now -- the suite and its host.  `exit 130/143/129`
+# reports the same status a signalled shell would while guaranteeing the handler runs.
+on_signal() { # $1 = signal name  $2 = exit status
+    SUITE_SIGNAL="$1"
+    warn "received SIG$1 -- cancelling this run"
+    stop_suite_group "$1"
+    reap_suite_host
+    exit "$2"
+}
 trap on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+trap 'on_signal HUP 129' HUP
 
 
 # ------------------------------------------------------------------------------------
@@ -2430,13 +2659,28 @@ run_suite() {
     # activate plugins over COM-RPC and drive threads through mocks: a plugin that never finishes
     # activating, or a wait that is never signalled, hangs here with no output, no exit and no
     # gate -- and in CI the job is eventually killed by the runner with no diagnosis attached.
-    # `timeout --foreground` keeps the child attached to the terminal so Ctrl-C still reaches it;
+    # `timeout --foreground` is kept, but NOT for the reason it usually is: the suite no longer
+    # runs in the terminal's foreground group at all (see the cancellation block next to
+    # `trap on_exit`).  It is kept because --foreground makes `timeout` refrain from putting its
+    # child in a process group of its OWN, which is what keeps `timeout`, the suite binary, the L2
+    # controller's `sh -c` and WPEFramework inside the one group the signal handler signals.  A
+    # Ctrl-C reaches the suite through that handler now, not through the terminal.
     # --kill-after is added only where the local timeout preserves exit 124 with it (see the
     # probe where TIMEOUT_KILL_AFTER is set).  Exit 124 is reported as a HANG in its own right,
     # because a hang and a failing assertion need different fixes.
     local suite_timeout
     suite_timeout="$(suite_timeout_for_level "$level")"
     log "  time limit      = ${suite_timeout}s (SUITE_TIMEOUT_${level^^})"
+    # Snapshot what already exists BEFORE the suite starts, so the cancellation and exit handlers
+    # can tell this run's Thunder host and COM-RPC socket from somebody else's.
+    note_pre_run_host_state "$level"
+    # CANCELLABLE: the suite is launched in the BACKGROUND and in its OWN PROCESS GROUP, and this
+    # shell waits on it, so an external INT/TERM/HUP reaches the handler WHILE the suite runs
+    # rather than after it -- see the block next to `trap on_exit`.  `timeout --foreground` is
+    # kept because it deliberately does not create a process group of its own, which is what keeps
+    # `timeout`, the suite binary, the L2 controller's `sh -c` and WPEFramework in the one group
+    # the handler signals.
+    set -m
     (
         cd -- "$run_dir" || exit 1
         export GTEST_OUTPUT="json:$results_path"
@@ -2478,7 +2722,22 @@ run_suite() {
         else
             "$TIMEOUT_BIN" --foreground "${TIMEOUT_KILL_AFTER[@]}" "$suite_timeout" "$binary_path"
         fi
-    ) || rc=$?
+    ) &
+    SUITE_PGID=$!
+    SUITE_PGID_GRACE="$SUITE_STOP_GRACE_SECONDS"
+    set +m
+    # `|| rc=$?` rather than a set +e / set -e pair: toggling errexit inside a function that may
+    # itself have been invoked in a `||` or `if !` context re-arms it where the caller had
+    # deliberately suppressed it, and the run would then abort at the first non-zero status
+    # instead of diagnosing it.  A trapped signal interrupts the wait either way, which is the
+    # whole point of waiting rather than running the suite in the foreground.
+    wait "$SUITE_PGID" || rc=$?
+    SUITE_PGID=''
+    SUITE_PGID_GRACE=''
+    # The host is stopped and the COM-RPC socket handed back before anything is measured: the L2
+    # controller normally stops Thunder itself, but a suite that fell over part-way through would
+    # otherwise leave a listener behind for the next run to inherit.
+    reap_suite_host
 
     if [ "$level" = l2 ] && [ -f "$framework_results" ]; then
         cp -f -- "$framework_results" "$results_path" 2>/dev/null || true
@@ -3005,7 +3264,7 @@ readonly CROSS_LEVEL_REFERENCE=(
     'l1/plugin/HdmiCecSourceImplementation.cpp=86.1'
     'l1/plugin/HdmiCecSourceImplementation.h=82.1'
     'l1/plugin/Module.cpp=0.0'
-    'l2/plugin/HdmiCecSource.cpp=75.5'
+    'l2/plugin/HdmiCecSource.cpp=79.2'
     'l2/plugin/HdmiCecSource.h=95.2'
     'l2/plugin/HdmiCecSourceImplementation.cpp=85.4'
     'l2/plugin/HdmiCecSourceImplementation.h=89.5'
@@ -3226,40 +3485,56 @@ gate_exempt_reason() {
             log "        that loads the plugin.  Saying 'uncoverable' unqualified would be false."
             ;;
         l2/plugin/HdmiCecSource.cpp)
-            log "        Reason: MEASURED at 40/53 = 75.5% under L2 -- the same figure the per-file"
-            log "        table above prints for this file, read off this run's trace.  All THIRTEEN"
+            log "        Reason: MEASURED at 42/53 = 79.2% under L2 -- the same figure the per-file"
+            log "        table above prints for this file, read off this run's trace.  All ELEVEN"
             log "        uncovered lines are enumerated below and grouped by what actually blocks"
-            log "        each one; every one of the thirteen is unreachable from the L2 execution"
-            log "        model, and each group's line list is what the trace records as uncovered:"
+            log "        each one, and each group's line list is what the trace records as uncovered:"
             log "          - the out-of-process teardown block (7 lines: 129, 131, 133-136, 138)."
             log "            Initialize() obtains the implementation with _service->Root<>(), and at"
             log "            L2 that resolves IN-PROCESS, so _connectionId stays 0 and"
             log "            _service->RemoteConnection(0) returns null -- Terminate(), its catch arm"
             log "            and Release() are dead by construction.  Corroborated by the run itself:"
-            log "            'Failed to terminate connection' appears zero times in the suite log."
-            log "          - the Root<> failure arm (3 lines: 87, 88, 93).  A live Thunder host"
-            log "            resolves Root<> against an installed, loadable implementation library;"
-            log "            there is no L2 seam that makes it return null, and manufacturing one"
-            log "            would be a production change."
-            log "          - Information() (2 lines: 149, 151).  IPlugin::Information() is pure"
-            log "            virtual at Thunder/Source/plugins/IPlugin.h:97 and is called nowhere in"
-            log "            Thunder R4.4.1 -- only the Controller's own override exists, so no L2"
-            log "            client can invoke it."
+            log "            the LOGWARN this plugin emits from that catch arm (HdmiCecSource.cpp:135)"
+            log "            appears nowhere in the suite output.  Its text is deliberately not quoted"
+            log "            here, so a grep for it cannot match this line and report itself."
+            log "            Reaching them needs the plugin instantiated OUT OF PROCESS, whose child"
+            log "            would hold its own unprogrammed copies of the force-included mocks --"
+            log "            a different harness, which specification section 0.2.1 forbids adding."
+            log "          - the Root<> failure arm (3 lines: 87, 88, 93).  BLOCKED BY A PRODUCTION"
+            log "            DEFECT, not by the harness.  IShell::Root() does return null in-process"
+            log "            when root.locator names an unloadable library (Shell.cpp:61-93) and"
+            log "            Controller.1.configuration@<callsign> accepts that configuration while"
+            log "            the plugin is DEACTIVATED, so a test CAN drive this arm -- but doing so"
+            log "            takes the host down: Initialize() calls Deinitialize(service) itself at"
+            log "            HdmiCecSource.cpp:93 (clearing _service at :145), then Thunder, seeing"
+            log "            the error string, calls Deactivate(INITIALIZATION_FAILED) which calls"
+            log "            Deinitialize a SECOND time, and that entry dereferences the now-null"
+            log "            _service at :143.  REQUIRED PRODUCTION CHANGE, reported not made"
+            log "            (Directive 6): make Deinitialize idempotent by returning early when"
+            log "            _service is already null, or drop Initialize's self-call and let"
+            log "            Thunder perform the single teardown.  These 3 lines ARE covered at L1."
             log "          - Deactivated(RPC::IRemoteConnection*) (1 line: 159), the body guarded by"
-            log "            the connection-id comparison.  Thunder invokes this method only when an"
-            log "            out-of-process connection dies, and the id-match cannot hold anyway:"
-            log "            connection ids start at 1 while _connectionId is 0 in-process.  Its"
-            log "            other instrumented lines (154, 156 and 161) ARE covered, so this group"
-            log "            is one line -- an earlier revision of this text claimed four here, and"
-            log "            also invented a fifth group of four 'non-STB profile rejection' lines"
-            log "            (61, 62, 112, 113) which the trace records as COVERED, 2 hits each."
-            log "        7 + 3 + 2 + 1 = 13 uncovered, so 53 - 13 = 40 covered = 75.5%, reconciling"
-            log "        with the figure printed above."
+            log "            the connection-id comparison.  The method IS reached at L2 -- its other"
+            log "            instrumented lines (154, 156 and 161) are covered, because Thunder"
+            log "            reports every COM-RPC channel this suite opens and closes to the"
+            log "            registered sink -- but the id-match cannot hold: connection ids start"
+            log "            at 1 while _connectionId is 0 in-process.  An earlier revision of this"
+            log "            text claimed four lines here, and also invented a fifth group of four"
+            log "            'non-STB profile rejection' lines (61, 62, 112, 113) which the trace"
+            log "            records as COVERED."
+            log "        7 + 3 + 1 = 11 uncovered, so 53 - 11 = 42 covered = 79.2%, reconciling"
+            log "        with the figure printed above.  Information() (149, 151) is NO LONGER in"
+            log "        this list: it is reachable over COM-RPC through the plugin's own"
+            log "        INTERFACE_ENTRY(PluginHost::IPlugin), and"
+            log "        PluginShellExposesIPluginAndReportsItsInformationString now covers it,"
+            log "        which is what moved this file from 40/53 to 42/53."
             log "        This repository's own L1 suite measures the SAME file at 53/53 = 100%, so the"
             log "        TARGET meets the specification-section-0.9.2 bar; what is below the bar is"
             log "        this one LEVEL's view of it.  No exclusion glob was added and COVERAGE_MIN"
-            log "        was not lowered -- the file stays in the denominator and its real 75.5% is"
-            log "        printed above."
+            log "        was not lowered -- the file stays in the denominator and its real 79.2% is"
+            log "        printed above.  The residual 0.8 points would be closed by the production"
+            log "        guard named above (45/53 = 84.9%), so this waiver is a pointer to a"
+            log "        specific fix rather than a permanent exemption."
             ;;
         *)
             warn "no documented reason is recorded for the exemption '$path' at ${level^^}."

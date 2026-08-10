@@ -5672,3 +5672,72 @@ TEST_F(HdmiCecSource_L2Test, PluginRefusesToActivateUnderANonSourceProfile)
     EXPECT_EQ(Core::ERROR_NONE, InvokeServiceMethod("org.rdk.HdmiCecSource.1", "getEnabled", params, result))
         << "the plugin activated but is not answering";
 }
+
+/**
+ * @brief The activated plugin answers QueryInterface for PluginHost::IPlugin and reports its
+ *        Information() string over COM-RPC.
+ *
+ * COVERAGE_GAPS.md traceability: gap-plugin-source-information (HdmiCecSource::Information,
+ * entservices-hdmicecsource/plugin/HdmiCecSource.cpp:149-152).
+ *
+ * WHY THIS CASE EXISTS AT L2 AT ALL, since nothing in the host ever calls the method.
+ * PluginHost::IPlugin::Information() is declared pure virtual at Thunder/Source/plugins/IPlugin.h:97
+ * and is called NOWHERE in Thunder R4.4.1 - a grep of Thunder/Source finds only the Controller's own
+ * override (Controller.cpp:176).  So no amount of activating, deactivating or driving the plugin
+ * reaches it, and the two instrumented lines of this plugin's override were two of the thirteen
+ * lines standing between this file's L2 figure and the 80% bar: 40/53 = 75.5% without them, 42/53 =
+ * 79.2% with them.  The remaining eleven are enumerated, with the measured reason each one is
+ * unreachable from a test at L2, in the L2_GATE_EXEMPT block of
+ * entservices-hdmicecsource/Tests/run_coverage.sh.
+ *
+ * It is reachable, though, and by a route that is ordinary rather than contrived.  The plugin
+ * publishes INTERFACE_ENTRY(PluginHost::IPlugin) (HdmiCecSource.h:160-164);
+ * Server::Service::QueryInterface forwards any id that is not IUnknown or IShell to the plugin
+ * handler (Thunder/Source/WPEFramework/PluginServer.cpp:277-301); and Thunder's generated
+ * ProxyStubs_Plugin.cpp marshals Information() across COM-RPC.  The fixture already holds a
+ * PluginHost::IShell for this callsign, acquired the same way every COM-RPC case in this file
+ * acquires its interface, so asking that shell for IPlugin is one QueryInterface away.  What the
+ * case therefore asserts is a real contract of the running plugin - that its IPlugin facet is
+ * reachable over COM-RPC and describes itself - and it happens to be the only route production
+ * offers to those two lines.
+ *
+ * NOT asserted: the literal sentence.  The text is prose a maintainer may legitimately reword (it
+ * currently carries a "PLugin" typo, which is production's to fix and not a test's to enshrine), so
+ * the assertions are the invariants that must hold whatever the wording - the call succeeds, the
+ * string is not empty, and it names the plugin it describes.  The string itself is logged so a
+ * reader of the run can see exactly what was returned.
+ *
+ * ADJACENT TO, AND NOT A REWRITE OF, ANY EXISTING CASE.  Every COM-RPC case in this file asks the
+ * shell for Exchange::IHdmiCecSource and drives the plugin's own API; none of them asks for the
+ * PluginHost::IPlugin facet, and none is touched here.
+ */
+TEST_F(HdmiCecSource_L2Test, PluginShellExposesIPluginAndReportsItsInformationString)
+{
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSourceInterfaceObject());
+    ScopedInterfaceSession session(*this);
+    ASSERT_NE(nullptr, m_controller_cecSource);
+
+    // RAII custody for the same reason the session guard exists: the far end holds a reference count
+    // for this pointer, and a count nobody hands back keeps the plugin alive past the deactivation
+    // that the profile-guard case and the fixture destructor both perform.  Declared after the
+    // session guard so it is destroyed before it, i.e. the facet is released before the shell and
+    // the plugin interface it was obtained from.
+    ScopedInterface<PluginHost::IPlugin> plugin(
+        m_controller_cecSource->QueryInterface<PluginHost::IPlugin>());
+    ASSERT_TRUE(static_cast<bool>(plugin))
+        << "the activated org.rdk.HdmiCecSource shell did not answer QueryInterface for "
+           "PluginHost::IPlugin.  The plugin declares INTERFACE_ENTRY(PluginHost::IPlugin), so "
+           "either the interface map no longer publishes it or Thunder's IPlugin proxy-stub is not "
+           "installed - both of which would also break anything else that asks a plugin to "
+           "describe itself.";
+
+    const string information = plugin->Information();
+    TEST_LOG("IPlugin::Information() returned: %s", information.c_str());
+    EXPECT_FALSE(information.empty())
+        << "IPlugin::Information() returned an empty string; the plugin describes itself to "
+           "anything that asks, so an empty description is a defect rather than a style choice.";
+    EXPECT_NE(string::npos, information.find(_T("HdmiCecSource")))
+        << "IPlugin::Information() does not name the plugin it describes; it returned: "
+        << information;
+}
+
