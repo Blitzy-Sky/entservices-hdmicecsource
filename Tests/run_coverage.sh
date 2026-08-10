@@ -169,6 +169,30 @@
 
 set -euo pipefail
 
+# ------------------------------------------------------------------------------------
+# FILE MODE FOR EVERYTHING THIS RUN CREATES.  Set here, before any path is resolved and
+# long before any byte is written, because every child inherits it too -- lcov, genhtml,
+# gcov, the Thunder host and the test binary all create files in this run's name.
+#
+# WHY THE DIRECTORY MODE WAS NOT ENOUGH.  create_level_artifact_dir() creates the level
+# directory 0700, but only when it does not exist yet, and it says nothing about the FILES
+# inside it: those were created at whatever umask the caller happened to have.  Under a
+# permissive umask -- `umask 000` is the case that was demonstrated -- and a level directory
+# that already existed with a permissive mode, every artifact was written 0666: the raw and
+# filtered traces (coverage_<level>.info, filtered_coverage_<level>.info), every page of the
+# genhtml report under coverage_<level>/, the archived GoogleTest results JSON, provenance.txt
+# and .run.lock.  An unprivileged local account could then read them, append to them, forge
+# the trace the gate is computed from, or squat on .run.lock and defeat the concurrency guard.  For a script whose only product is
+# trustworthy coverage evidence that is the failure that matters: not confidentiality -- the
+# artifacts hold source paths and counts, never secrets -- but INTEGRITY.
+#
+# 077 rather than 022 because group and other have no business here at all: the suite, lcov,
+# genhtml and the gate all run as this user in this process tree, and CI collects the
+# artifacts as the same user that produced them.  provenance.txt already chmod'd itself to
+# 600; this makes every other artifact match it instead of leaving it the exception.
+# ------------------------------------------------------------------------------------
+umask 077
+
 # Resolved from this script's own location so that the working directory of the caller is
 # irrelevant: Tests/ -> <repository> -> <workspace>.  No path is hard-coded.
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
@@ -347,6 +371,12 @@ mint_artifact_root() {
         /*) ;;
         *)  die "TMPDIR must be an absolute path to be checked safely; got: $parent" ;;
     esac
+    # TMPDIR is caller-controlled too, so it gets the same treatment a named ARTIFACT_ROOT gets:
+    # collapsed first, then checked for where it actually lands.  Without this a TMPDIR of
+    # /tmp/x/../../../etc would put the minted root under /etc by exactly the route a named value
+    # is refused for -- the guard has to cover both ways in, or it covers neither.
+    parent="$(canonicalise_path_lexically "$parent")"
+    assert_artifact_location_plausible "$parent/$REPO_NAME-coverage" "TMPDIR"
     assert_safe_ancestry "$parent/$REPO_NAME-coverage" minted
     ARTIFACT_ROOT="$("$MKTEMP_BIN" -d "$parent/$REPO_NAME-coverage.XXXXXXXX")" \
         || die "could not create an artifact root under $parent.  Set ARTIFACT_ROOT to write
@@ -813,6 +843,146 @@ assert_private_dir() { # $1=path
        use has mode $mode, which lets other accounts read or write it: $path"
 }
 
+# ------------------------------------------------------------------------------------
+# ONE PRIVACY POSTURE, WHETHER THE ARTIFACT DIRECTORY WAS CREATED BY THIS RUN OR FOUND.
+#
+# mint_artifact_root() ends at `chmod 0700` + assert_private_dir, and create_safe_dir()
+# creates a NEW level directory 0700 one component at a time -- so a directory this script
+# brings into existence is owner-only.  A directory that already existed got neither:
+# assert_component_safe() accepts a mode-0755 directory (correctly, for an ANCESTOR), so a
+# pre-existing 0755 level directory stayed 0755 and every artifact under it was reachable by
+# any local account able to traverse it.  That is the path by which an unprivileged user was
+# able to read and forge the gate's own input.
+#
+# TIGHTENED RATHER THAN REFUSED, and only when the mode actually grants something away: the
+# directory is this run's own artifact directory under a root the caller chose, so narrowing
+# it changes nothing the caller needs, it is announced when it happens, and refusing instead
+# would turn an ordinary ARTIFACT_ROOT=~/cov into a hard failure over a bit this script can
+# simply fix.  A chmod that does not take IS fatal: continuing would write evidence somewhere
+# it can still be replaced.
+# ------------------------------------------------------------------------------------
+restrict_artifact_dir_to_owner() { # $1=directory this run writes its artifacts into
+    local dir="$1" mode
+    mode="$(stat -c '%a' -- "$dir" 2>/dev/null)" \
+        || die "cannot stat the artifact directory to check its mode: $dir"
+    if [ "$(( 8#$mode & 0077 ))" -ne 0 ]; then
+        chmod 700 -- "$dir" \
+            || die "the artifact directory $dir is mode $mode -- readable or writable by other
+       accounts -- and could not be tightened to 0700.  Everything written there is the evidence
+       this run is judged on, and another account able to write it can replace a trace between
+       the capture and the gate.  Fix its permissions, or point ARTIFACT_ROOT at a directory you
+       own."
+        warn "tightened the artifact directory from mode $mode to 0700: $dir"
+        warn "    Its contents are the traces, the table and the logs the gate and the"
+        warn "    traceability report rest on, so no other account may read or replace them."
+    fi
+    # The same assertion the minted root gets, so both cases end in the same state rather than
+    # in two states that merely look similar.
+    assert_private_dir "$dir"
+}
+
+# ------------------------------------------------------------------------------------
+# LEXICAL CANONICALISATION -- collapse '.', '..' and doubled slashes, and NOTHING ELSE.
+#
+# WHY IT IS NEEDED.  Absolute is not the same as canonical.  An ARTIFACT_ROOT of
+# "$HOME/ok/../../../../etc/name" is already absolute, so it passed straight into the
+# ancestry walk -- which validated each "…/ok/..", "…/ok/../.." component as an ordinary
+# existing root-owned directory, created what was missing, and wrote the artifacts into a
+# system tree.  Every individual check held; the PATH had simply left the tree the caller
+# appeared to name.  Collapsing first means the ancestry checks, the location guard and the
+# messages a reader sees all describe the one directory that will actually be written to.
+#
+# WHY IT IS LEXICAL AND NOT `realpath`.  `realpath` without --no-symlinks RESOLVES symbolic
+# links, which would quietly retire this script's strongest guarantee -- that it refuses to
+# write THROUGH a link (assert_safe_ancestry, create_safe_dir) rather than following it.  A
+# resolved path has no links left to refuse.  Collapsing textually keeps every link visible to
+# those checks, and needs no external tool.
+#
+# `local -` scopes the option change, so `set -f` (no pathname expansion while the value is
+# split on '/') cannot leak into the caller: without it a component containing '*' would be
+# glob-expanded during the split.
+# ------------------------------------------------------------------------------------
+canonicalise_path_lexically() { # $1=absolute path -> canonical path on stdout
+    local input="$1" out='' component saved_ifs
+    local -
+    set -f
+
+    saved_ifs="$IFS"
+    IFS='/'
+    # Deliberate word splitting on '/' to walk the components in order.
+    # shellcheck disable=SC2086
+    set -- ${input#/}
+    IFS="$saved_ifs"
+
+    for component in "$@"; do
+        case "$component" in
+            ''|.)  : ;;                        # '' comes from a doubled slash; '.' is a no-op
+            ..)    out="${out%/*}" ;;          # one level up, textually -- never via the filesystem
+            *)     out="$out/$component" ;;
+        esac
+    done
+    printf '%s\n' "${out:-/}"
+}
+
+# ------------------------------------------------------------------------------------
+# WHERE AN ARTIFACT ROOT MAY NOT BE.  The length test in resolve_level_inputs() already
+# existed for ARTIFACT_ROOT and for the build directory; what it cannot see is a path that is
+# long enough and still lands in a system tree -- either because '..' collapsed it there or
+# because it was typed that way.  This makes the system-location half explicit, and the same
+# refusal now exists in all three sibling runners rather than in two of them.
+#
+# The list holds only trees the operating system owns.  /tmp, /var/tmp, /run/user/<uid>, /opt,
+# /home and /root are legitimate destinations and are NOT refused, and neither is a path inside
+# the checkout -- pointing ARTIFACT_ROOT back into the tree is documented as the way to
+# reproduce CI's layout.  A guard that broke a documented usage would be a worse defect than
+# the one it closes.
+# ------------------------------------------------------------------------------------
+readonly PROTECTED_SYSTEM_ROOTS=(
+    /bin /boot /dev /etc /lib /lib32 /lib64 /libx32 /proc /run /sbin /sys /usr /var
+)
+
+assert_artifact_location_plausible() { # $1=canonical absolute path  $2=how it was chosen
+    local path="$1" origin="$2" root
+
+    case "$path" in
+        /)  die "the artifact root must not be '/' ($origin).  Artifacts are written to
+       \$ARTIFACT_ROOT/$REPO_NAME/<level>/, that directory is replaced on every run, and a lock
+       file is taken inside it; the filesystem root is not a place to do that." ;;
+        /*) : ;;
+        *)  die "internal error: assert_artifact_location_plausible needs an absolute path;
+       got '$path' ($origin)." ;;
+    esac
+
+    [ "${#path}" -gt 4 ] || die "the artifact root '$path' is implausibly short ($origin).
+       Report directories are created and replaced underneath it, so a near-root path is
+       refused.  Give a path that is unmistakably yours, for example
+       \"\${TMPDIR:-/tmp}/$REPO_NAME-coverage\", or leave ARTIFACT_ROOT unset and let this
+       script mint an unpredictable mode-0700 root with mktemp -d."
+
+    # Checked BEFORE the protected-root loop, because /var/tmp and /run/user/<uid> are ordinary
+    # per-user scratch directories that happen to live under a protected root.
+    case "$path" in
+        /var/tmp|/var/tmp/*|/run/user/*) return 0 ;;
+    esac
+
+    for root in "${PROTECTED_SYSTEM_ROOTS[@]}"; do
+        case "$path" in
+            "$root"|"$root"/*)
+                die "refusing to write coverage artifacts to
+           $path
+       ($origin), because it is $root or lies underneath it -- a directory the operating system
+       owns.  This script creates directories there, takes .run.lock inside them and replaces
+       fixed artifact names on every run; none of that belongs in a system tree, and a value that
+       reaches one is nearly always a '..' that collapsed out of the intended path or a mistyped
+       root.
+       Use \"\${TMPDIR:-/tmp}/$REPO_NAME-coverage\", a directory inside your own tree, or leave
+       ARTIFACT_ROOT unset and let this script mint an unpredictable mode-0700 root with
+       mktemp -d." ;;
+        esac
+    done
+    return 0
+}
+
 # Re-run the ancestry check immediately before a destructive step, and check the specific
 # artifact path too.  A path that was safe when the run started is not necessarily safe
 # thirty seconds later: this is the check that makes the guarantee hold at the moment of
@@ -1134,7 +1304,15 @@ Environment variables (all optional; shown with their defaults):
                                  chosen path is printed when the run starts.  Set it to a
                                  fixed path if you need one, and that path's whole ancestry
                                  is then checked strictly (no symlink, owned by you or root,
-                                 not writable by others).  Disposable build output -- never
+                                 not writable by others), it is collapsed lexically first so
+                                 a '..' cannot land the artifacts outside the tree it appears
+                                 to name, and it is refused outright if it is near-root or
+                                 inside a system tree -- /etc, /usr, /var and the rest; /tmp,
+                                 /var/tmp, /run/user, /opt, /home, /root and anywhere in your
+                                 own checkout are all accepted.  The level directory is then
+                                 brought to mode 0700 and every file written under it is
+                                 0600, whether this run created it or found it.
+                                 Disposable build output -- never
                                  commit it.  Created only after the level's prerequisites
                                  have been validated.  Currently: ${ARTIFACT_ROOT:-<minted per run>}
   COVERAGE_MIN=80                Line-coverage bar, applied to the level aggregate AND to
@@ -1709,6 +1887,23 @@ resolve_level_inputs() {
     [ "${#ARTIFACT_ROOT}" -gt 4 ] || die "ARTIFACT_ROOT '$ARTIFACT_ROOT' is implausibly short; refusing to
        create and delete report directories underneath it."
 
+    # COLLAPSED, THEN CHECKED FOR WHERE IT LANDS -- and both before create_level_artifact_dir()
+    # is reached, because that function CREATES what is missing and anything it is handed has
+    # already been created by the time a later check could object.  The length test above cannot
+    # see a long path that still ends up in a system tree, which is what '..' produces.  The
+    # collapsed form is printed when it differs from what the caller set, because a path that
+    # quietly means somewhere else is the whole defect being closed here.
+    if [ "$ARTIFACT_ROOT_EXPLICIT" -eq 1 ]; then
+        local named_artifact_root="$ARTIFACT_ROOT"
+        ARTIFACT_ROOT="$(canonicalise_path_lexically "$ARTIFACT_ROOT")"
+        if [ "$ARTIFACT_ROOT" != "$named_artifact_root" ]; then
+            log "the artifact root you set collapses to: $ARTIFACT_ROOT"
+            log "    as given: $named_artifact_root"
+        fi
+    fi
+    assert_artifact_location_plausible "$ARTIFACT_ROOT" \
+        "$( [ "$ARTIFACT_ROOT_EXPLICIT" -eq 1 ] && printf 'ARTIFACT_ROOT' || printf 'minted under TMPDIR' )"
+
     # RESOLVED here, CREATED later.  This function only decides where the artifacts will go;
     # create_level_artifact_dir() below makes the directory, and it is called after this
     # level's build and install trees have been validated.  The split exists because a run
@@ -1863,7 +2058,22 @@ create_level_artifact_dir() {
     # final component only, which would leave the intermediates at the umask default even
     # briefly -- long enough for another account to reach into them.
     create_safe_dir "$LEVEL_ARTIFACT_DIR"
-    log "${level^^} artifact directory ready: $LEVEL_ARTIFACT_DIR"
+    # ...and then to the same posture a minted root gets, which is what covers the case
+    # create_safe_dir cannot: a level directory that ALREADY existed with group or other
+    # access.  See restrict_artifact_dir_to_owner's own comment for why it tightens rather
+    # than refuses.
+    restrict_artifact_dir_to_owner "$LEVEL_ARTIFACT_DIR"
+    # THE LOCK IS TAKEN HERE, and until now it was not taken at all.  acquire_artifact_lock()
+    # was defined above and never called from anywhere, so the exclusive advisory lock this
+    # file's own EVIDENCE CUSTODY block promises -- "an exclusive advisory lock, so two
+    # concurrent runs cannot interleave captures into the same files" -- did not exist in
+    # practice: two runs sharing one ARTIFACT_ROOT would both write coverage_<level>.info and
+    # each verdict would describe a mixture.  The sibling sink runner calls it from exactly
+    # this point in exactly this function, so the two now behave identically, and it is called
+    # after the directory has been created and brought to 0700 because the lock file lives
+    # inside that directory.
+    acquire_artifact_lock "$LEVEL_ARTIFACT_DIR"
+    log "${level^^} artifact directory ready: $LEVEL_ARTIFACT_DIR (owner-only, locked for this run)"
 }
 
 # ------------------------------------------------------------------------------------
