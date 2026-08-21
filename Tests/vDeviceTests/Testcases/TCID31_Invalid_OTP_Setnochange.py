@@ -1,29 +1,51 @@
 """
 /**
  * @file TCID31_Invalid_OTP_Setnochange.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID31_Invalid_OTP_Setnochange
- * @details Validates the 'TCID31_Invalid_OTP_Setnochange' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Writes setOTPEnabled(enabled=true) for a deterministic baseline, reads
+ *          getOTPEnabled, sends the malformed HdmiCECSource_Curl.set_otp_enabled_invalid -
+ *          whose params carry the misspelled key "ennable" instead of "enabled" - and reads
+ *          getOTPEnabled again. All three of the baseline read, the malformed reply and the
+ *          final read must be non-empty.
+ *
+ *          TWO TARGET BEHAVIOURS ARE ADMITTED DELIBERATELY, and the case says which: the
+ *          malformed request may be REJECTED with an error object, or ACCEPTED with
+ *          result.success true. Either way the final state must remain VALID, meaning
+ *          result.enabled is a bool and result.success is True. A reply that is neither an
+ *          error nor a success fails.
+ *
+ *          The baseline value is captured and compared into a local the verdict does not
+ *          consult, because a target that normalises the setting rather than leaving it
+ *          untouched is not considered a failure. What is asserted is that a malformed write
+ *          cannot leave the setting in a state that is not a boolean.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - None beyond the plugin being reachable; the baseline is written by the case itself.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command and the logging helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - The malformed request is either rejected or accepted, and afterwards getOTPEnabled
+ *    reports success true with a boolean enabled.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - All three replies are non-empty, the final reply reports success True with a boolean
+ *    enabled, the malformed reply is either an error object or a success, and run_test()
+ *    returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - Any of the three replies is empty; the final reply's enabled is not a bool or its success
+ *    is not True; the malformed reply is neither an error nor a success; or parsing raises.
  */
 """
 

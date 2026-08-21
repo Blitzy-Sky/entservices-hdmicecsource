@@ -1,29 +1,50 @@
 """
 /**
  * @file TCID26_Standby_Then_OTP_Wakeup.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID26_Standby_Then_OTP_Wakeup
- * @details Validates the 'TCID26_Standby_Then_OTP_Wakeup' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Posts Device_CEC_Message_Userdef.yaml, sends
+ *          org.rdk.HdmiCecSource.sendStandbyMessage, posts Device_Status.yaml, then sends
+ *          performOTPAction - a standby request followed by a wake-up request with the
+ *          emulated peer's state reported in between.
+ *
+ *          ONLY THE OTP REPLY CARRIES THE VERDICT. _json_success() requires result to be a
+ *          dict whose success is exactly True, and it treats any parsing exception as a
+ *          failure. The standby reply is required only to be non-empty, and both posts are
+ *          advisory.
+ *
+ *          Neither the standby broadcast nor the peer's power transition is observable through
+ *          this transport, so what the case establishes is that the plugin ACCEPTS a
+ *          one-time-play walk after a standby request - not that a peer woke up.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - The vComponent API is reachable and serving the emulated CEC peers; HDMICEC_CMD_BASE
+ *    resolves to the commands directory this module posts from.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command, send_vcomponent_command, HDMICEC_CMD_BASE and the logging
+ *    helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
+ *  - vcomponent_configurations/commands/Device_CEC_Message_Userdef.yaml
+ *  - vcomponent_configurations/commands/Device_Status.yaml
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - The standby request answers and the performOTPAction reply carries result.success true.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - Both requests return a non-empty response, the OTP reply parses with result a dict whose
+ *    success is True, and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - Either request returns nothing, or the OTP reply lacks a result dict with success True -
+ *    including the case where it does not parse.
  */
 """
 

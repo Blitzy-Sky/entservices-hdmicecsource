@@ -1,29 +1,58 @@
 """
 /**
  * @file TCID17_Menu_Language_CECversion_Flow.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID17_Menu_Language_CECversion_Flow
- * @details Validates the 'TCID17_Menu_Language_CECversion_Flow' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Exercises the menu-language and CEC-version request handlers and then a device
+ *          removal. Device_Get_Menu_Language.yaml, Device_Set_Menu_Language.yaml and
+ *          Device_Get_CEC_Version.yaml are posted with two-second settle windows;
+ *          org.rdk.HdmiCecSource.getDeviceList is then read twice; Device_Remove.yaml is
+ *          posted; and getDeviceList is read twice more.
+ *
+ *          The paired reads are a SETTLING AND LOGGING device, not a comparison: nothing is
+ *          diffed between the two reads of a pair, and the inventory before the removal is not
+ *          compared with the inventory after it. Each read's body is logged.
+ *
+ *          The vComponent posts here are ADVISORY: _post_hdmicec() returns whether the API
+ *          answered HTTP 200 and the case logs that result without consulting it, so a
+ *          rejected document does not fail the case. A stricter contract would assert each
+ *          post and each reply body; the criteria below describe what this module enforces,
+ *          not what a stricter version could.
+ *
+ *          THE VERDICT IS THAT ALL FOUR getDeviceList REQUESTS ANSWERED. Position 02 is the
+ *          case that validates the inventory's shape, and position 21 is the case that pairs
+ *          an add with a remove.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - The vComponent API is reachable and serving the emulated CEC peers; HDMICEC_CMD_BASE
+ *    resolves to the commands directory this module posts from.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command, send_vcomponent_command, HDMICEC_CMD_BASE and the logging
+ *    helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
+ *  - vcomponent_configurations/commands/Device_Get_Menu_Language.yaml
+ *  - vcomponent_configurations/commands/Device_Set_Menu_Language.yaml
+ *  - vcomponent_configurations/commands/Device_Get_CEC_Version.yaml
+ *  - vcomponent_configurations/commands/Device_Remove.yaml
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - The four documents are accepted (logged) and each of the four getDeviceList reads returns
+ *    a response.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - All four getDeviceList requests return a non-empty response and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - Any of the four getDeviceList requests returns nothing, so run_test() returns False. A
+ *    rejected vComponent post does not fail this position.
  */
 """
 

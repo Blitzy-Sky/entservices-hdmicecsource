@@ -1,29 +1,43 @@
 """
 /**
  * @file TCID29_Repeated_Disable_Idempotent.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID29_Repeated_Disable_Idempotent
- * @details Validates the 'TCID29_Repeated_Disable_Idempotent' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Sends setEnabled(enabled=false) twice, reading getEnabled after each write, and
+ *          then RESTORES the state with setEnabled(enabled=true) before the verdict is
+ *          computed - so the disabled stack cannot leak into the positions that follow even
+ *          when the case fails.
+ *
+ *          THE VERDICT IS THE SECOND READ ALONE: result.enabled must be exactly False. That is
+ *          the idempotence claim - the second disable neither toggled the setting back nor
+ *          left the reader reporting something other than false. The first read's value is
+ *          logged only, and none of the three write replies is inspected.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - None beyond the plugin being reachable; the case is valid from either CEC state.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command and the logging helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - After two disables the reader reports result.enabled false, and CEC is re-enabled before
+ *    the case returns.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - The second getEnabled returns a non-empty response reporting enabled False, and
+ *    run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - The second read returns nothing, enabled is not exactly False, or parsing raises. The
+ *    re-enable request has been issued on every one of those paths.
  */
 """
 

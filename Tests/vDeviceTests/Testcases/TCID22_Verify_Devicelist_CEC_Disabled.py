@@ -1,29 +1,57 @@
 """
 /**
  * @file TCID22_Verify_Devicelist_CEC_Disabled.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID22_Verify_Devicelist_CEC_Disabled
- * @details Validates the 'TCID22_Verify_Devicelist_CEC_Disabled' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details A negative-path case: it drives the emulated HAL into failure and checks that the
+ *          plugin keeps answering. org.rdk.HdmiCecSource.getEnabled and getDeviceList are read
+ *          for a baseline; Device_Setapi_Open_Fail.yaml and Device_Setapi_Logic_Fail.yaml are
+ *          posted; then setEnabled(enabled=true) is sent and getDeviceList is read again while
+ *          the HAL open and logical-address calls are returning errors.
+ *
+ *          THESE TWO POSTS ARE REQUIRED, unlike the advisory posts elsewhere in this suite:
+ *          _post_hdmicec()'s result is checked and a rejected document fails the case, because
+ *          without the injected fault there is no negative path to exercise.
+ *
+ *          The second half runs inside a try/except that logs an exception as a WARNING and
+ *          continues, so what this position asserts is that the plugin remains responsive
+ *          under HAL failure - not that any particular reply is produced. Every reply body is
+ *          logged.
+ *
+ *          THE INJECTED FAULT IS NOT UNDONE HERE. Position 23 posts
+ *          Device_Setapi_Open_Pass.yaml, which clears it; a run that stops between the two
+ *          leaves the emulated HAL failing.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - The vComponent API is reachable and serving the emulated CEC peers; HDMICEC_CMD_BASE
+ *    resolves to the commands directory this module posts from.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command, send_vcomponent_command, HDMICEC_CMD_BASE and the logging
+ *    helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
+ *  - vcomponent_configurations/commands/Device_Setapi_Open_Fail.yaml
+ *  - vcomponent_configurations/commands/Device_Setapi_Logic_Fail.yaml
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - Both fault-injection documents are accepted, and each of the four JSON-RPC requests -
+ *    getEnabled, getDeviceList, setEnabled(true) and getDeviceList - returns a response.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - Both documents are accepted, all four JSON-RPC requests return a non-empty response, and
+ *    run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - Either fault-injection document is rejected, or any of the four JSON-RPC requests returns
+ *    nothing. An exception raised in the second half is warned about and does not fail the
+ *    case.
  */
 """
 

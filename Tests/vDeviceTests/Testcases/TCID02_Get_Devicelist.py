@@ -1,29 +1,47 @@
 """
 /**
  * @file TCID02_Get_Devicelist.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID02_Get_Devicelist
- * @details Validates the 'TCID02_Get_Devicelist' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Calls org.rdk.HdmiCecSource.getDeviceList and validates the SHAPE of the published
+ *          inventory rather than a fixed census, so the case is stable whether or not
+ *          discovery has completed: result.success is exactly True, result.numberofdevices is
+ *          an int, the deviceList is consistent with that count, and every entry is a dict
+ *          carrying an int logicalAddress.
+ *
+ *          Consistency is asymmetric on purpose. When the count is 0 the list may be absent or
+ *          an empty list; when it is positive the list must be a list whose length is at least
+ *          the count, because some targets exclude placeholder or NA entries from the count
+ *          while still publishing them. A list longer than the count is therefore not a
+ *          failure.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - No specific peer is required. Init_Devicelist_Populate normally seeds six devices before
+ *    the suite starts, but none of the assertions here depends on any of them.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command and the logging helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - success true, an integer device count, a deviceList consistent with that count, and
+ *    entries whose logicalAddress members are integers.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - All four predicates hold - success is True, the count is an int, the list is consistent
+ *    with the count, and every entry validates - and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - Empty response; success not True; the count not an int; a positive count with a non-list
+ *    or a shorter list; an entry that is not a dict or whose logicalAddress is not an int; or
+ *    a JSONDecodeError.
  */
 """
 

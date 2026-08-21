@@ -4,19 +4,37 @@
  * @brief SuitManager.py
  *
  * @testcase SuitManager
- * @details Orchestrates the HDMI CEC Source L2 test suite by dynamically loading and executing
- *          test case modules, activating the required RDK plugin via JSON-RPC, and reporting
- *          per-test pass/fail results with summary statistics.
+ * @details Orchestrates the HDMI CEC Source L3/device-level test suite by dynamically loading
+ *          and executing test case modules, activating the required RDK plugin via JSON-RPC,
+ *          and reporting per-test pass/fail results with summary statistics. The suite is
+ *          authored here and its runtime execution is deferred to a device or emulator
+ *          environment; nothing in this repository runs it.
+ *
+ *          This module is the command-line entry point of the suite, and the name on disk is
+ *          the name to invoke: python3 SuitManager.py [-t] hdmicecsource. The spelling is the
+ *          established repository convention, shared with the HDMI CEC Sink suite's entry
+ *          point so the two device-level suites stay symmetric, and it must not be
+ *          "corrected" - a case-sensitive filesystem rejects any other spelling.
+ *
+ *          This module never starts, emulates or stubs the services the cases talk to. It
+ *          activates the plugin through Controller.1.activate, runs the suite's initialization
+ *          module once, then calls each case's run_test() with stdout captured so a case's own
+ *          logging is replayed under its result.
  *
  * @precondition
  *  - WPEFramework is running and reachable at the configured JSON-RPC endpoint.
- *  - The org.rdk.HdmiCecSource plugin is available for activation.
+ *  - The org.rdk.HdmiCecSource plugin is available for activation. Activation is on by default
+ *    and can be suppressed with AUTO_ACTIVATE_PLUGINS=0.
  *  - All test case modules listed in SUITES are present under the Testcases/ directory.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - Testcases/*.py
+ *  - utils.py - the only module this one imports: the JSON-RPC dispatcher, the resolved
+ *    endpoint URL and the logging helpers
+ *  - Init_Devicelist_Populate.py - loaded by name through SUITE_INIT_MODULES and run once
+ *    before the first case; a False return aborts the suite
+ *  - Testcases/TCID*.py - the 33 registered case modules, imported by name from the tests list
+ *  - HdmiCECSource_Curl.py is a dependency of those cases rather than of this module, which
+ *    composes its own controller call through utils.py and builds no CEC request
  *
  * @expected_result
  *  - All registered test cases are executed in order and results are logged.
@@ -42,7 +60,7 @@ from utils import log_error, log_info, log_success, send_jsonrpc_command, WPEFRA
 BASE_DIR = Path(__file__).resolve().parent
 SUITES = {
     "hdmicecsource": {
-        "banner": "******************** L2 SUITE - RDK - HDMI CEC SOURCE ****************************",
+        "banner": "******************** L3 SUITE - RDK - HDMI CEC SOURCE ****************************",
         "module_dir": BASE_DIR / "Testcases",
         "tests": [
             "TCID01_Send_Standby_Message",

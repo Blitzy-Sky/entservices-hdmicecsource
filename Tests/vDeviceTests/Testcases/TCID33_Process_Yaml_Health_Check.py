@@ -1,29 +1,71 @@
 """
 /**
  * @file TCID33_Process_Yaml_Health_Check.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID33_Process_Yaml_Health_Check
- * @details Validates the 'TCID33_Process_Yaml_Health_Check' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details A sweep over every inbound-frame fixture this suite ships. The case enumerates
+ *          Process_*.yaml under vcomponent_configurations/commands recursively, sorted by
+ *          POSIX-relative name, and fails immediately if none is found - so a suite that lost
+ *          its fixtures is reported rather than passing vacuously.
+ *          Device_Config_Add_Network.yaml is posted first and is REQUIRED (a non-200 fails the
+ *          case), because the device-list checks need the emulated topology in place, with the
+ *          audio system at logical address 5.
+ *
+ *          getDeviceList health and a device snapshot are captured BEFORE and AFTER the sweep.
+ *          A snapshot records the published count and the set of integer logical addresses;
+ *          health means the reply parses as a dict carrying a "result" member.
+ *
+ *          TWO SUBSETS GET EXTRA OBSERVATION. The four documents that should reach the device
+ *          list - Process_Report_Physical_Address, Process_CEC_Version, Process_Set_OSD_Name
+ *          and Process_Device_Vendor_ID - are given a 1.5 s window for the full inbound
+ *          pipeline and then a snapshot, whose unavailability is recorded as a state-check
+ *          failure. The four routing and active-source documents - Process_Routing_Change,
+ *          Process_Routing_Information, Process_Set_Stream_Path and
+ *          Process_Request_Active_Source - must leave getActiveSourceStatus healthy
+ *          afterwards, meaning result.status is a bool and result.success is True. Every other
+ *          document gets a 0.2 s window and acceptance only.
+ *
+ *          THE CASE IS ACCEPTANCE-BASED FOR HANDLERS WITH NO API-VISIBLE EFFECT, and it logs
+ *          that limitation itself: per-handler proof would need implementation counters or
+ *          plugin-log parsing, neither of which this transport has. The final guard is
+ *          monotonic - the post-sweep device count must not be lower than the pre-sweep count,
+ *          so a sweep that destabilised the inventory is reported.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - The vComponent API is reachable and serving the emulated CEC peers; HDMICEC_CMD_BASE
+ *    resolves to the commands directory this module posts from.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command, send_vcomponent_command, HDMICEC_CMD_BASE and the logging
+ *    helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
+ *  - vcomponent_configurations/commands/Device_Config_Add_Network.yaml
+ *  - vcomponent_configurations/commands/Process_*.yaml - every document matching this pattern,
+ *    enumerated at run time rather than listed, so a fixture added later is swept without
+ *    editing this module.
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - At least one Process_*.yaml is found; the configure document and every enumerated
+ *    document are accepted; getDeviceList is healthy before and after; both snapshots are
+ *    obtained; no state check fails; and the device count does not drop across the sweep.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - All of the above hold and run_test() returns True; the pass log reports how many process
+ *    documents were posted.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - No Process_*.yaml found; the configure document rejected; any enumerated document
+ *    rejected; either health check failing; either snapshot unavailable; any state-check
+ *    failure (a missing snapshot after a device-list document, or an unhealthy
+ *    getActiveSourceStatus after a routing document); or a post-sweep device count lower than
+ *    the pre-sweep count.
  */
 """
 

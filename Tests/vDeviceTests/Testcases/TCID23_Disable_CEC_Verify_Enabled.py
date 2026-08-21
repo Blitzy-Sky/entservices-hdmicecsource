@@ -1,29 +1,58 @@
 """
 /**
  * @file TCID23_Disable_CEC_Verify_Enabled.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID23_Disable_CEC_Verify_Enabled
- * @details Validates the 'TCID23_Disable_CEC_Verify_Enabled' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Disables CEC, confirms the reader answers, then tries to re-enable it while the
+ *          emulated HAL open call is forced to fail. setEnabled(enabled=false) is sent;
+ *          getEnabled is read; Device_Setapi_Open_Fail.yaml is posted;
+ *          setEnabled(enabled=true) is sent against the failing HAL; and
+ *          Device_Setapi_Open_Pass.yaml is posted as a POST-CONDITION.
+ *
+ *          BOTH POSTS ARE REQUIRED - a rejection fails the case. The closing
+ *          Device_Setapi_Open_Pass.yaml is what clears the injected open failure, both this
+ *          position's and the one position 22 leaves behind, which is why it is a
+ *          post-condition rather than an advisory step.
+ *
+ *          The re-enable call sits in a try/except that FAILS the case on an exception. That
+ *          is the difference from position 22, which warns and continues: here the enable
+ *          attempt under fault is the observation, so an exception is a result rather than
+ *          noise.
+ *
+ *          Every reply body is logged rather than parsed; what is asserted is that each
+ *          request answered and that both documents were accepted.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - The vComponent API is reachable and serving the emulated CEC peers; HDMICEC_CMD_BASE
+ *    resolves to the commands directory this module posts from.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command, send_vcomponent_command, HDMICEC_CMD_BASE and the logging
+ *    helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
+ *  - vcomponent_configurations/commands/Device_Setapi_Open_Fail.yaml
+ *  - vcomponent_configurations/commands/Device_Setapi_Open_Pass.yaml
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - Both documents are accepted in order (fault injected, then cleared), and each of the
+ *    three JSON-RPC requests - setEnabled(false), getEnabled, setEnabled(true) - returns a
+ *    response.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - Both documents are accepted, all three JSON-RPC requests return a non-empty response, no
+ *    exception escapes the enable attempt, and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - Either document is rejected, any of the three requests returns nothing, or the re-enable
+ *    attempt raises - in which case the injected fault is left uncleared and run_test()
+ *    returns False.
  */
 """
 

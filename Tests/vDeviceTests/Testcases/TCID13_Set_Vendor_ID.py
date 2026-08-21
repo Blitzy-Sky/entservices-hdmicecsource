@@ -1,29 +1,43 @@
 """
 /**
  * @file TCID13_Set_Vendor_ID.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID13_Set_Vendor_ID
- * @details Validates the 'TCID13_Set_Vendor_ID' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Sends org.rdk.HdmiCecSource.setVendorId with params vendorid "0x0019FB" and
+ *          compares the whole envelope against a success reply. The reply is compared as a
+ *          WHOLE ENVELOPE, so the jsonrpc member and the request id 42 are part of the
+ *          contract and not only the result body.
+ *
+ *          The plugin parses the string with stoi(value, NULL, 16), packs the low three bytes
+ *          into appVendorId and persists the number under cecVendorId, which is the path that
+ *          lets position 14 read the value back. The constant is the plugin's own provisioned
+ *          default, so what this position establishes is that the write is ACCEPTED - not that
+ *          it changed the value.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - None beyond the plugin being reachable.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command and the logging helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - The reply parses as JSON and equals {"jsonrpc":"2.0","id":42,"result":{"success":true}}
+ *    exactly.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - The response is non-empty, the parsed reply equals that envelope exactly, and run_test()
+ *    returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - Empty response, any envelope difference, a JSONDecodeError, or run_test() returns False.
  */
 """
 

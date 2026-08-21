@@ -1,29 +1,44 @@
 """
 /**
  * @file TCID01_Send_Standby_Message.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID01_Send_Standby_Message
- * @details Validates the 'TCID01_Send_Standby_Message' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Sends org.rdk.HdmiCecSource.sendStandbyMessage, which takes no parameters, by
+ *          handing HdmiCECSource_Curl.send_standby_message to send_curl_command; the request
+ *          is referenced rather than rebuilt so the transport contract stays in one place. The
+ *          reply is compared as a WHOLE ENVELOPE, so the jsonrpc member and the request id 42
+ *          are part of the contract and not only the result body.
+ *
+ *          The <Standby> frame the plugin broadcasts as a consequence travels on the CEC bus,
+ *          which this transport cannot observe, so the acknowledgement is all that is
+ *          asserted. The case must not be read as evidence that the broadcast reached a peer.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - CEC is enabled. The plugin defaults cecEnabled to true when its persisted settings file
+ *    carries no such label, and positions 03 and 09 both leave it enabled.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command and the logging helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - The reply parses as JSON and equals {"jsonrpc":"2.0","id":42,"result":{"success":true}}
+ *    exactly.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - The response is non-empty, the parsed reply equals that envelope exactly, and run_test()
+ *    returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - Empty response, any difference anywhere in the envelope including the id or the jsonrpc
+ *    member, a JSONDecodeError, or run_test() returns False.
  */
 """
 

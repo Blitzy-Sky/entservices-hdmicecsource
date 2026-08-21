@@ -1,29 +1,49 @@
 """
 /**
  * @file TCID24_Standby_Userdef_Busstatus.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID24_Standby_Userdef_Busstatus
- * @details Validates the 'TCID24_Standby_Userdef_Busstatus' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Posts Device_CEC_Message_Userdef.yaml and Device_Bus_Status.yaml - BOTH REQUIRED,
+ *          the case fails if either is not accepted - and then sends
+ *          org.rdk.HdmiCecSource.sendStandbyMessage and asserts the reply's NESTED fields:
+ *          result must be a dict and result.success exactly True.
+ *
+ *          Reading the result body rather than comparing a whole envelope is the difference
+ *          from position 01: the id and jsonrpc members are not part of this case's contract,
+ *          so the standby request is asserted after emulation without pinning the envelope
+ *          shape twice.
+ *
+ *          A JSONDecodeError is swallowed and falls through to the failure log, so an
+ *          unparseable reply fails the case rather than raising out of run_test().
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - The vComponent API is reachable and serving the emulated CEC peers; HDMICEC_CMD_BASE
+ *    resolves to the commands directory this module posts from.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command, send_vcomponent_command, HDMICEC_CMD_BASE and the logging
+ *    helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
+ *  - vcomponent_configurations/commands/Device_CEC_Message_Userdef.yaml
+ *  - vcomponent_configurations/commands/Device_Bus_Status.yaml
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - Both documents are accepted and the standby reply carries result.success true.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - Both posts are accepted, the standby response is non-empty, result is a dict whose
+ *    success is True, and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - Either post is rejected, the standby request returns nothing, result is missing or not a
+ *    dict, success is not exactly True, or the reply does not parse.
  */
 """
 

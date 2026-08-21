@@ -1,29 +1,49 @@
 """
 /**
  * @file TCID28_Invalid_VendorID_Nochange.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID28_Invalid_VendorID_Nochange
- * @details Validates the 'TCID28_Invalid_VendorID_Nochange' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Establishes a baseline with a valid setVendorId followed by getVendorId, sends the
+ *          malformed request HdmiCECSource_Curl.set_vendor_id_invalid, and reads getVendorId
+ *          again. The malformation is a misspelled parameter key - the params object carries
+ *          "vllendorid" instead of "vendorid" - so the plugin receives no vendor id at all
+ *          rather than an out-of-range one.
+ *
+ *          THE VERDICT IS THAT THE VALUE DID NOT MOVE: both the baseline and the final reply
+ *          must carry a "result" member and their result.vendorid values must be equal. The
+ *          value itself is not pinned, so the case holds on a target provisioned with any
+ *          vendor id.
+ *
+ *          Only the final read is explicitly required to be non-empty. An empty baseline
+ *          surfaces as an exception while parsing, which the case catches and turns into a
+ *          failure rather than letting it escape run_test().
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - None beyond the plugin being reachable; the baseline this case compares against is
+ *    written by the case itself.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command and the logging helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - The malformed request leaves the vendor id unchanged: the baseline and final replies
+ *    report the same result.vendorid.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - The final read returns a non-empty response, both replies carry a result member, the two
+ *    vendorid values are equal, and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - The final read returns nothing; either reply lacks a result member; the two vendorid
+ *    values differ; or parsing raises.
  */
 """
 

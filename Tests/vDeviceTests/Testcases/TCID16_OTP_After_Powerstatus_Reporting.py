@@ -1,29 +1,57 @@
 """
 /**
  * @file TCID16_OTP_After_Powerstatus_Reporting.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID16_OTP_After_Powerstatus_Reporting
- * @details Validates the 'TCID16_OTP_After_Powerstatus_Reporting' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Builds a device entry through the middleware's normal CEC processing path instead
+ *          of a topology dump file, then drives a one-time-play walk. Five documents are
+ *          posted in order with settle windows: Process_Report_Physical_Address.yaml, whose
+ *          <Report Physical Address> reaches addDevice(); Process_Set_OSD_Name.yaml and
+ *          Process_Device_Vendor_ID.yaml, which fill that entry's name and vendor; then
+ *          Device_CEC_Message.yaml and Device_Status.yaml. Finally
+ *          org.rdk.HdmiCecSource.performOTPAction is sent over JSON-RPC.
+ *
+ *          The vComponent posts here are ADVISORY: _post_hdmicec() returns whether the API
+ *          answered HTTP 200 and the case logs that result without consulting it, so a
+ *          rejected document does not fail the case. A stricter contract would assert each
+ *          post and each reply body; the criteria below describe what this module enforces,
+ *          not what a stricter version could.
+ *
+ *          THE VERDICT IS THE OTP REQUEST ALONE: that send_curl_command returned a non-empty
+ *          response. The reply body is logged, not parsed, so a refusal such as ERROR_GENERAL
+ *          still passes here - position 06 is the case that asserts the OTP reply itself.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - The vComponent API is reachable and serving the emulated CEC peers; HDMICEC_CMD_BASE
+ *    resolves to the commands directory this module posts from.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command, send_vcomponent_command, HDMICEC_CMD_BASE and the logging
+ *    helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
+ *  - vcomponent_configurations/commands/Process_Report_Physical_Address.yaml
+ *  - vcomponent_configurations/commands/Process_Set_OSD_Name.yaml
+ *  - vcomponent_configurations/commands/Process_Device_Vendor_ID.yaml
+ *  - vcomponent_configurations/commands/Device_CEC_Message.yaml
+ *  - vcomponent_configurations/commands/Device_Status.yaml
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - The five documents are accepted by the vComponent API (logged), and the performOTPAction
+ *    request produces a response.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - The performOTPAction request returns a non-empty response and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - The performOTPAction request returns nothing, so run_test() returns False. A rejected
+ *    vComponent post or an unsuccessful OTP body does not fail this position.
  */
 """
 

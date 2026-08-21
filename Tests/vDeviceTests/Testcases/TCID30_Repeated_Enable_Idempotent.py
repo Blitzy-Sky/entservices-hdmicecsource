@@ -1,29 +1,39 @@
 """
 /**
  * @file TCID30_Repeated_Enable_Idempotent.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID30_Repeated_Enable_Idempotent
- * @details Validates the 'TCID30_Repeated_Enable_Idempotent' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Sends setEnabled(enabled=true) twice, reading getEnabled after each write, and
+ *          requires the second read to report result.enabled exactly True - the idempotence
+ *          claim for the true operand.
+ *
+ *          Nothing is restored, and nothing needs to be: enabled is the state the rest of the
+ *          suite expects, and it is the state position 29's own restore leaves behind. The
+ *          first read's value is logged only, and neither write reply is inspected.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - None beyond the plugin being reachable; the case is valid from either CEC state.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command and the logging helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - After two enables the reader reports result.enabled true.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - The second getEnabled returns a non-empty response reporting enabled True, and run_test()
+ *    returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - The second read returns nothing, enabled is not exactly True, or parsing raises.
  */
 """
 

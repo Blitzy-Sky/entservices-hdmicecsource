@@ -1,29 +1,42 @@
 """
 /**
  * @file TCID04_Get_OTP_Enabled.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID04_Get_OTP_Enabled
- * @details Validates the 'TCID04_Get_OTP_Enabled' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Writes its own precondition before reading. setOTPEnabled(enabled=true) is sent
+ *          first and its reply is deliberately NOT inspected, so this position cannot fail for
+ *          a reason that belongs to position 12; then getOTPEnabled is called and the NESTED
+ *          fields are asserted - result.success exactly True and result.enabled exactly True.
+ *
+ *          Reading the nested members rather than comparing a whole envelope is what allows
+ *          the precondition write and the read to be separate steps; the id and jsonrpc
+ *          members are not part of this case's contract.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - None beyond the plugin being reachable. The one-time-play setting the read expects is
+ *    established by this module itself.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command and the logging helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - The read reply parses as JSON and carries result.success true with result.enabled true.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - The read response is non-empty, result.success is True, result.enabled is True, and
+ *    run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - The read returns nothing, success is not exactly True, enabled is not exactly True, or a
+ *    JSONDecodeError is raised.
  */
 """
 

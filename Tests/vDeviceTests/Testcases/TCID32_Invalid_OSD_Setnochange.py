@@ -1,29 +1,47 @@
 """
 /**
  * @file TCID32_Invalid_OSD_Setnochange.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID32_Invalid_OSD_Setnochange
- * @details Validates the 'TCID32_Invalid_OSD_Setnochange' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details The same shape as position 31, applied to the OSD name: a valid setOSDName
+ *          baseline, a getOSDName read, the malformed HdmiCECSource_Curl.set_osd_name_invalid
+ *          - whose params carry the misspelled key "nnamme" instead of "name" - and a final
+ *          getOSDName read. All three replies must be non-empty.
+ *
+ *          TWO TARGET BEHAVIOURS ARE ADMITTED: the malformed request may be REJECTED with an
+ *          error object or ACCEPTED with result.success true. Either way the final state must
+ *          remain VALID, meaning result.name is a str and result.success is True.
+ *
+ *          A NORMALISED NAME PASSES - the empty string, for instance - which is exactly why
+ *          the baseline comparison is computed into a local the verdict does not consult. The
+ *          claim is that a malformed write cannot leave the name as something other than a
+ *          string, not that the name is unchanged.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - None beyond the plugin being reachable; the baseline is written by the case itself.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command and the logging helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - The malformed request is either rejected or accepted, and afterwards getOSDName reports
+ *    success true with a string name.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - All three replies are non-empty, the final reply reports success True with a string name,
+ *    the malformed reply is either an error object or a success, and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - Any of the three replies is empty; the final reply's name is not a str or its success is
+ *    not True; the malformed reply is neither an error nor a success; or parsing raises.
  */
 """
 

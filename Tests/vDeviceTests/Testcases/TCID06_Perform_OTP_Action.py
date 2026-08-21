@@ -1,29 +1,45 @@
 """
 /**
  * @file TCID06_Perform_OTP_Action.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID06_Perform_OTP_Action
- * @details Validates the 'TCID06_Perform_OTP_Action' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Waits three seconds for the plugin to settle, calls
+ *          org.rdk.HdmiCecSource.performOTPAction - the only request in this suite given an
+ *          eight second curl budget, because the plugin walks the bus behind it - and then
+ *          reads getDeviceList to learn the device count.
+ *
+ *          TWO outcomes are admitted, and the second is the point of the case: result.success
+ *          exactly True, OR an error whose message is exactly "ERROR_GENERAL" together with a
+ *          device count of exactly 0. The plugin's PerformOTPAction requires CEC and the
+ *          one-time-play setting to be enabled and a device to act on, so ERROR_GENERAL with
+ *          an empty inventory is a correct target response rather than a defect. ERROR_GENERAL
+ *          while devices ARE listed fails, and so does any other error.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - CEC and the one-time-play setting are enabled - both default to true and positions 04 and
+ *    12 also write them.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command and the logging helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - Either the walk is accepted (result.success true) or it is refused with ERROR_GENERAL
+ *    while the published device count is 0.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - The OTP response is non-empty and either predicate holds, and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - The OTP request returns nothing; an error other than ERROR_GENERAL; ERROR_GENERAL while
+ *    the device count is not 0; or a JSONDecodeError on the OTP reply.
  */
 """
 

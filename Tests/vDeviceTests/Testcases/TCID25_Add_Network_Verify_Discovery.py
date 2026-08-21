@@ -1,29 +1,63 @@
 """
 /**
  * @file TCID25_Add_Network_Verify_Discovery.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID25_Add_Network_Verify_Discovery
- * @details Validates the 'TCID25_Add_Network_Verify_Discovery' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Checks that adding peers to the emulated network does not shrink the published
+ *          inventory, with a legacy escape hatch for targets that still carry the original
+ *          event script. _resolve_send_events_script() searches four tiers in order: the
+ *          SEND_EVENTS_SCRIPT environment override; three fixed candidates (a sendEvents.sh
+ *          five levels above this directory, one beside this module, and /tmp/sendEvents.sh);
+ *          and an OLD_TESTCASE_RDKE/rdkservices/L2HalMock/sendEvents.sh beneath any ancestor
+ *          directory. The first existing candidate is run with /bin/bash.
+ *
+ *          SCRIPT HANDLING IS ASYMMETRIC ON PURPOSE: a non-zero exit or an exception from the
+ *          script FAILS the case, while the script being absent is only a warning and the
+ *          vComponent path is used instead - so a target without the legacy asset is
+ *          supported, but a target whose script breaks is reported.
+ *
+ *          org.rdk.HdmiCecSource.getDeviceList is read for a baseline;
+ *          Device_Config_Add_Network.yaml and Device_Status.yaml are posted and BOTH ARE
+ *          REQUIRED; then getDeviceList is read again.
+ *
+ *          THE VERDICT IS MONOTONIC RATHER THAN EXACT: the final reply must carry no "error"
+ *          member, result.success exactly True, and an integer numberofdevices which, when a
+ *          baseline count was obtained, must be greater than or equal to it. A count that grew
+ *          is accepted, a count that shrank is not, and a missing baseline reduces the check
+ *          to the integer requirement rather than failing the case.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - The vComponent API is reachable and serving the emulated CEC peers; HDMICEC_CMD_BASE
+ *    resolves to the commands directory this module posts from.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command, send_vcomponent_command, HDMICEC_CMD_BASE and the logging
+ *    helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
+ *  - vcomponent_configurations/commands/Device_Config_Add_Network.yaml
+ *  - vcomponent_configurations/commands/Device_Status.yaml
+ *  - Optionally a legacy sendEvents.sh, located through SEND_EVENTS_SCRIPT or one of the
+ *    fallback paths; its absence is supported.
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - The legacy script, if present, exits zero; both documents are accepted; and the final
+ *    getDeviceList reports success with a device count no lower than the baseline.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - No script failure, both posts accepted, a non-empty final reply with no error member,
+ *    success True and an integer count at least the baseline, and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - The legacy script exits non-zero or raises; either post is rejected; the final request
+ *    returns nothing; the reply carries an error member; success is not True; the count is not
+ *    an int or is lower than the baseline; or the reply does not parse.
  */
 """
 

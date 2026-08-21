@@ -1,29 +1,56 @@
 """
 /**
  * @file TCID27_Active_Source_Transition_After_OTP.py
- * @brief L2 HDMI CEC functional testcase.
+ * @brief L3 HDMI CEC Source functional testcase.
  *
  * @testcase TCID27_Active_Source_Transition_After_OTP
- * @details Validates the 'TCID27_Active_Source_Transition_After_OTP' HDMI CEC behavior through JSON-RPC and/or vComponent command flow.
+ * @details Reads org.rdk.HdmiCecSource.getActiveSourceStatus for a baseline, posts
+ *          Device_Add.yaml and Device_Status.yaml - BOTH REQUIRED - sends performOTPAction,
+ *          then reads getActiveSourceStatus again.
+ *
+ *          THE VERDICT IS ON THE FINAL READ ONLY: result.success exactly True and
+ *          result.status exactly True, meaning the device reports itself as the active source
+ *          after the one-time-play walk. The baseline read must return a non-empty response,
+ *          and its own status value is parsed and then deliberately discarded - it exists to
+ *          show the reader answered before the transition, not to be compared with the final
+ *          value.
+ *
+ *          The performOTPAction reply is required to be non-empty but is not parsed; a walk
+ *          that reported failure while the status still flipped would pass, which is the
+ *          honest reading of what the module checks.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSource plugin is active and reachable at the JSON-RPC endpoint;
+ *    SuitManager activates it with Controller.1.activate before the first case runs.
+ *  - The vComponent API is reachable and serving the emulated CEC peers; HDMICEC_CMD_BASE
+ *    resolves to the commands directory this module posts from.
+ *  - CEC and the one-time-play setting are enabled, otherwise the walk is refused and the
+ *    final status cannot become true.
+ *  - Authored for device-level execution and NOT executed: every criterion below states what
+ *    this module asserts, not an observed result. README.txt.txt records the deferred status
+ *    and the prerequisites that are unavailable.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSource_Curl.py
- *  - suiteManager.py
- *  - vcomponent_configurations/hdmicec/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - send_curl_command, send_vcomponent_command, HDMICEC_CMD_BASE and the logging
+ *    helpers.
+ *  - HdmiCECSource_Curl.py - the JSON-RPC request constants this module dispatches.
+ *  - SuitManager.py - the runner that registers this module and calls run_test().
+ *  - vcomponent_configurations/commands/Device_Add.yaml
+ *  - vcomponent_configurations/commands/Device_Status.yaml
  *
  * @expected_result
- *  - API responses and scenario validations match expected values.
+ *  - Both posts are accepted, all three JSON-RPC requests answer, and the final
+ *    getActiveSourceStatus reports success true with status true.
  *
  * @pass_criteria
- *  - Expected response equals actual response and testcase returns True.
+ *  - Both posts accepted, the baseline read, the OTP request and the final read each return a
+ *    non-empty response, the final reply reports success True and status True, and run_test()
+ *    returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - Either post is rejected; any of the three requests returns nothing; the final reply
+ *    reports success other than True or status other than True; or the final reply does not
+ *    parse.
  */
 """
 
